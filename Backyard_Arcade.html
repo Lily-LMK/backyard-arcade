@@ -1,0 +1,4065 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+  <title>Backyard Arcade</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,400;1,500&display=swap" rel="stylesheet">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:#030306; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; background:#030306; touch-action:none; }
+    #fileInput { position:fixed; left:-9999px; top:-9999px; }
+    #fallback {
+      position: fixed; inset: 0; display:none;
+      padding: 18px; background: rgba(0,0,0,0.92); color: rgba(255,255,255,0.92);
+      font: 14px/1.45 Barlow, sans-serif;
+      overflow:auto;
+    }
+    #fallback h1{font-size:18px;margin:0 0 10px 0}
+    #fallback code{white-space:pre-wrap; color: rgba(200,255,220,0.92)}
+  </style>
+</head>
+<body>
+  <input id="fileInput" type="file" accept=".csv,text/csv"/>
+  <canvas id="c"></canvas>
+
+  <div id="fallback">
+    <h1>Canvas app failed to start</h1>
+    <div>If you see a black screen, scroll here for the error.</div>
+    <div style="margin-top:10px"><strong>Error:</strong></div>
+    <code id="err"></code>
+  </div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- Error overlay ----------
+  const fallback = document.getElementById('fallback');
+  const errBox = document.getElementById('err');
+  function showError(e){
+    try{
+      const msg = (e && (e.stack || e.message)) ? String(e.stack || e.message) : String(e);
+      errBox.textContent = msg;
+      fallback.style.display = 'block';
+    }catch(_){}
+  }
+
+  try {
+    // ---------- Helpers ----------
+    const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+    const lerp=(a,b,t)=>a+(b-a)*t;
+    const rnd=(n)=>Math.floor(Math.random()*n);
+    const choose=(arr)=>arr[rnd(arr.length)];
+    const safeStr=(s)=> (s==null?'':String(s));
+    const safeLower=(s)=> safeStr(s).trim().toLowerCase();
+    const nowISO=()=> new Date().toISOString().slice(0,10);
+
+    // Returns the index of a random row from pool that has a non-empty, non-bad image_url.
+    // Pass requireSci=true to also require a non-empty scientific_name (invaders/snake need this).
+    function pickValidRow(pool, maxTries=900, requireSci=false){
+      if(!pool || !pool.length) return null;
+      let tries=0;
+      while(tries++<maxTries){
+        const idx=pool[rnd(pool.length)];
+        const row=data.rows[idx];
+        const url=getCol(row,'image_url').trim();
+        if(!url || data.badImage.has(url)) continue;
+        if(requireSci && !getCol(row,'scientific_name').trim()) continue;
+        return idx;
+      }
+      return null;
+    }
+
+    // Resolves the active image record for a slot, trying the medium URL if the large one fails.
+    function resolveImageRec(slot){
+      let rec=slot.img || loadImage(slot.url);
+      if(rec.ready && !rec.ok && slot.urlMed && !slot._fallbackTried){
+        slot._fallbackTried=true;
+        slot.img=loadImage(slot.urlMed);
+        rec=slot.img;
+      }
+      return rec;
+    }
+
+    // Draws img aspect-ratio-fitted and centre-clipped inside imgBox {x,y,w,h}.
+    // Optional panX/panY shifts the image within the clipped box (parallax effect).
+    function drawFitImage(imgBox, img, margin, r, panX, panY){
+      const ar0=img.width/img.height;
+      let dw=imgBox.w-margin*2, dh=imgBox.h-margin*2;
+      if(dw/dh > ar0) dw=dh*ar0; else dh=dw/ar0;
+      const dx=imgBox.x+(imgBox.w-dw)/2+(panX||0), dy=imgBox.y+(imgBox.h-dh)/2+(panY||0);
+      ctx.save();
+      roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,r);
+      ctx.clip();
+      ctx.globalAlpha=0.98;
+      ctx.drawImage(img, dx, dy, dw, dh);
+      ctx.restore();
+    }
+
+    // ---------- Color Palette ----------
+    const palette = {
+      green:   '#00a561', // South Bank – Quiz
+      blue:    '#46c2d2', // Tropics – Sorting Table
+      red:     '#ea3d41', // Rail Workshops – Sheet Invaders
+      orange:  '#f7941d', // Cobb+Co – Specimen Snake
+      purple:  '#b14c9b', // Collections & Research – Night Walk
+      pink:    '#f95caf', // Foundation
+    };
+    const sceneColors = {
+      home:     palette.green,
+      quiz:     palette.green,
+      match:    palette.blue,
+      night:    palette.purple,
+      invaders: palette.red,
+      snake:    palette.orange,
+    };
+    function hexToRgba(hex, a){
+      const r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
+      return `rgba(${r},${g},${b},${a})`;
+    }
+    function sceneAccent(a){ return hexToRgba(sceneColors[scene]||palette.green, a); }
+
+    // ---------- Canvas ----------
+    const canvas = document.getElementById('c');
+    let ctx = null;
+    try { ctx = canvas.getContext('2d', { alpha:false, desynchronized:true }); } catch(_){ ctx=null; }
+    if(!ctx){ try { ctx = canvas.getContext('2d'); } catch(_){ ctx=null; } }
+    if(!ctx) throw new Error('Could not acquire 2D canvas context.');
+
+    // ---------- Offscreen helpers ----------
+    function createOffscreen(w, h){
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(w));
+      c.height = Math.max(1, Math.round(h));
+      return c;
+    }
+
+    // ---------- Pre-rendered firefly glow sprite ----------
+    let _fireflyGlow = null;
+    function getFireflyGlow(){
+      if(_fireflyGlow) return _fireflyGlow;
+      const sz = 32;
+      const c = createOffscreen(sz, sz);
+      const g = c.getContext('2d');
+      const rad = g.createRadialGradient(sz/2, sz/2, 0, sz/2, sz/2, sz/2);
+      rad.addColorStop(0, 'rgba(57,255,20,0.55)');
+      rad.addColorStop(0.3, 'rgba(57,255,20,0.18)');
+      rad.addColorStop(0.7, 'rgba(57,255,20,0.04)');
+      rad.addColorStop(1, 'rgba(57,255,20,0)');
+      g.fillStyle = rad;
+      g.fillRect(0, 0, sz, sz);
+      _fireflyGlow = c;
+      return c;
+    }
+
+    // ---------- Circular image cache ----------
+    // Pre-renders images as clipped circles into offscreen canvases.
+    // Eliminates expensive per-frame save/clip/restore cycles from ALL games.
+    const circleCache = new Map();
+    const CIRCLE_CACHE_MAX = 200;
+    function getCircleImage(img, diameter){
+      if(!img) return null;
+      const d = Math.round(Math.max(8, Math.min(diameter, 160))); // snap to reasonable sizes
+      const key = (img.src || '') + '|' + d;
+      if(circleCache.has(key)){
+        const entry = circleCache.get(key);
+        circleCache.delete(key); circleCache.set(key, entry); // LRU bump
+        return entry;
+      }
+      const c = createOffscreen(d, d);
+      const g = c.getContext('2d');
+      g.beginPath(); g.arc(d/2, d/2, d/2, 0, Math.PI*2); g.clip();
+      const scale = Math.max(d/Math.max(1,img.width), d/Math.max(1,img.height));
+      const dw = img.width*scale, dh = img.height*scale;
+      g.drawImage(img, (d-dw)/2, (d-dh)/2, dw, dh);
+      circleCache.set(key, c);
+      while(circleCache.size > CIRCLE_CACHE_MAX){
+        const first = circleCache.keys().next().value;
+        if(first==null) break;
+        circleCache.delete(first);
+      }
+      return c;
+    }
+
+    // ---------- Cached sky gradient ----------
+    let _skyGrad = null;
+    let _skyGradH = 0;
+    function getSkyGradient(){
+      if(_skyGrad && _skyGradH === H) return _skyGrad;
+      const g = ctx.createLinearGradient(0,0,0,H);
+      g.addColorStop(0,'#020610');
+      g.addColorStop(0.35,'#050818');
+      g.addColorStop(0.7,'#030612');
+      g.addColorStop(1,'#01030a');
+      _skyGrad = g;
+      _skyGradH = H;
+      return g;
+    }
+
+    // ---------- Cached vignette gradient ----------
+    let _vigGrad = null;
+    let _vigW = 0, _vigH = 0;
+    function getVignetteGradient(){
+      if(_vigGrad && _vigW === W && _vigH === H) return _vigGrad;
+      const vg = ctx.createRadialGradient(W/2,H/2, Math.min(W,H)*0.2, W/2,H/2, Math.max(W,H)*0.9);
+      vg.addColorStop(0,'rgba(0,0,0,0)');
+      vg.addColorStop(1,'rgba(0,0,0,0.70)');
+      _vigGrad = vg;
+      _vigW = W; _vigH = H;
+      return vg;
+    }
+
+    // ---------- Dimensions ----------
+    const DPR = () => Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    let W=0, H=0, dpr=1;
+    function setCanvasSize(){
+      dpr = DPR();
+      W = Math.floor(window.innerWidth);
+      H = Math.floor(window.innerHeight);
+      canvas.width = Math.floor(W*dpr);
+      canvas.height= Math.floor(H*dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+      // Invalidate cached gradients
+      _skyGrad = null;
+      _vigGrad = null;
+      _fireflyGlow = null;
+    }
+
+    // ---------- UI ----------
+    const ui = {
+      buttons: [],
+      pointer:{x:0,y:0,down:false,clicked:false},
+      drag:null, // {type, id, offx, offy}
+      wheel:0,
+    };
+    function clearButtons(){ ui.buttons.length=0; }
+    function addButton(x,y,w,h,label,fn,opts={}){ ui.buttons.push({x,y,w,h,label,fn,opts}); }
+    function hitRect(r, px, py){ return px>=r.x && px<=r.x+r.w && py>=r.y && py<=r.y+r.h; }
+    function hitBtn(b, px, py){ if(b.opts && b.opts.hidden) return false; return px>=b.x && px<=b.x+b.w && py>=b.y && py<=b.y+b.h; }
+    function roundRect(x,y,w,h,r){
+      r = Math.min(r, w/2, h/2);
+      ctx.beginPath();
+      ctx.moveTo(x+r,y);
+      ctx.arcTo(x+w,y,x+w,y+h,r);
+      ctx.arcTo(x+w,y+h,x,y+h,r);
+      ctx.arcTo(x,y+h,x,y,r);
+      ctx.arcTo(x,y,x+w,y,r);
+      ctx.closePath();
+    }
+
+    function drawCircleImageCover(img, cx, cy, r, alpha=1){
+      if(!img) return;
+      const d = Math.round(r*2);
+      const cached = getCircleImage(img, d);
+      if(cached){
+        ctx.globalAlpha = alpha;
+        ctx.drawImage(cached, cx - d/2, cy - d/2, d, d);
+        ctx.globalAlpha = 1;
+      } else {
+        // fallback (shouldn't happen)
+        ctx.save();
+        ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.clip();
+        const scale = Math.max((r*2)/Math.max(1,img.width), (r*2)/Math.max(1,img.height));
+        const dw = img.width*scale, dh = img.height*scale;
+        ctx.globalAlpha = alpha;
+        ctx.drawImage(img, cx-dw/2, cy-dh/2, dw, dh);
+        ctx.restore();
+      }
+    }
+
+    function setPointerFromEvent(e){
+      const rect = canvas.getBoundingClientRect();
+      ui.pointer.x = (e.clientX - rect.left);
+      ui.pointer.y = (e.clientY - rect.top);
+    }
+    canvas.addEventListener('mousemove', (e)=> setPointerFromEvent(e), {passive:true});
+    canvas.addEventListener('mousedown', (e)=>{ setPointerFromEvent(e); ui.pointer.down=true; touchInteraction(); pointerDown(); }, {passive:true});
+    window.addEventListener('mouseup', ()=>{ ui.pointer.down=false; pointerUp(); }, {passive:true});
+    canvas.addEventListener('click', (e)=>{ setPointerFromEvent(e); ui.pointer.clicked=true; }, {passive:true});
+    canvas.addEventListener('wheel', (e)=>{ ui.wheel += e.deltaY; }, {passive:true});
+
+    // Touch
+    canvas.addEventListener('touchstart', (e)=>{
+      e.preventDefault();
+      const t=e.changedTouches[0];
+      const rect=canvas.getBoundingClientRect();
+      ui.pointer.x=t.clientX-rect.left;
+      ui.pointer.y=t.clientY-rect.top;
+      ui.pointer.down=true;
+      ui.pointer.clicked=true;
+      touchInteraction();
+      pointerDown();
+    }, {passive:false});
+    canvas.addEventListener('touchmove', (e)=>{
+      e.preventDefault();
+      const t=e.changedTouches[0];
+      const rect=canvas.getBoundingClientRect();
+      ui.pointer.x=t.clientX-rect.left;
+      ui.pointer.y=t.clientY-rect.top;
+      pointerMove();
+    }, {passive:false});
+    canvas.addEventListener('touchend', (e)=>{
+      e.preventDefault();
+      ui.pointer.down=false;
+      pointerUp();
+    }, {passive:false});
+
+    // Drag/drop CSV
+    window.addEventListener('dragover', (e)=>{ e.preventDefault(); }, {passive:false});
+    window.addEventListener('drop', (e)=>{
+      e.preventDefault();
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if(f) handleCSVFile(f);
+    }, {passive:false});
+
+    // ---------- Toasts ----------
+    const toasts=[];
+    function toast(msg, kind='info', ms=2400){ toasts.push({msg:safeStr(msg), kind, t0:performance.now(), ms}); }
+    function drawToasts(){
+      const now=performance.now();
+      for(let i=toasts.length-1;i>=0;i--){
+        if(now - toasts[i].t0 > toasts[i].ms) toasts.splice(i,1);
+      }
+      const pad=16;
+      const active=toasts.slice(-4);
+      for(let i=0;i<active.length;i++){
+        const t=active[i];
+        const age=now - t.t0;
+        const fade = age > (t.ms-420) ? clamp(1 - (age-(t.ms-420))/420, 0, 1) : 1;
+        ctx.font='500 13px Barlow, sans-serif';
+        const tw=ctx.measureText(t.msg).width;
+        const w=Math.min(W-pad*2, tw+28);
+        const h=32;
+        const x=W-pad-w;
+        const y=pad + i*(h+10);
+        roundRect(x,y,w,h,999);
+        const accent = (t.kind==='ok') ? palette.green : (t.kind==='warn') ? palette.red : (sceneColors[scene]||palette.green);
+        ctx.fillStyle = hexToRgba(accent, 0.12*fade); ctx.fill();
+        ctx.strokeStyle= hexToRgba(accent, 0.30*fade); ctx.lineWidth=1; ctx.stroke();
+        // accent dot
+        ctx.beginPath(); ctx.arc(x+14, y+h/2, 3, 0, Math.PI*2);
+        ctx.fillStyle = hexToRgba(accent, 0.8*fade); ctx.fill();
+        ctx.fillStyle='rgba(255,255,255,'+(0.88*fade)+')';
+        ctx.textAlign='left'; ctx.textBaseline='middle';
+        ctx.fillText(t.msg, x+24, y+h/2);
+      }
+    }
+
+    // ---------- Keyboard ----------
+    const keysDown=new Set();
+    let paused=false;
+    let showHelp=false;
+    window.addEventListener('keydown', (e)=>{
+      if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key)) e.preventDefault();
+      keysDown.add(e.key);
+      touchInteraction();
+
+      if(e.key==='Escape'){ if(showHelp){ showHelp=false; } else if(scene==='night'&&night.selected){ night.closeModal(); } else goto('home'); }
+      if(e.key==='p' || e.key==='P'){ paused = !paused; toast(paused?'Paused':'Resumed','info',900); }
+      if(e.key==='?' || e.key==='/'){ showHelp = !showHelp; }
+      if(e.key==='f' || e.key==='F'){ toggleFullscreen(); }
+
+      if(scene==='invaders' && (e.key===' ' || e.key==='Enter')) invaders.fire();
+      if(scene==='invaders' && (e.key==='i' || e.key==='I')) invaders.toggleLabelMode();
+      if(scene==='invaders' && (e.key==='r' || e.key==='R')) invaders.reset(true);
+
+      if(scene==='snake' && (e.key==='r' || e.key==='R')) snake.reset(true);
+
+      if(scene==='quiz' && (e.key==='n' || e.key==='N')) quiz.newQuestion();
+      if(scene==='quiz' && (e.key==='m' || e.key==='M')) quiz.toggleMode();
+
+      if(scene==='night' && (e.key==='ArrowLeft')){ if(night.selected) night.modalPrev(); else night.prevDate(); }
+      if(scene==='night' && (e.key==='ArrowRight')){ if(night.selected) night.modalNext(); else night.nextDate(); }
+      if(scene==='night' && (e.key===' ') && !night.selected) night.toggleAuto();
+    }, {passive:false});
+    window.addEventListener('keyup', (e)=> keysDown.delete(e.key), {passive:true});
+
+    
+    // ---------- Speech (TTS) ----------
+    const tts = {
+      supported: (typeof window !== 'undefined') && ('speechSynthesis' in window) && ('SpeechSynthesisUtterance' in window),
+      voices: [],
+      voice: null,
+      init(){
+        if(!this.supported) return;
+        const load = ()=>{
+          try{
+            this.voices = speechSynthesis.getVoices() || [];
+            this.voice = pickPreferredVoice(this.voices);
+          }catch(_){}
+        };
+        load();
+        try{ speechSynthesis.onvoiceschanged = load; }catch(_){}
+      },
+      speak(text){
+        if(!this.supported) return;
+        text = safeStr(text).trim();
+        if(!text) return;
+        try{
+          speechSynthesis.cancel();
+          const u = new SpeechSynthesisUtterance(text);
+          if(this.voice) u.voice = this.voice;
+          else u.lang = 'en-AU';
+          u.rate = 0.92;
+          u.pitch = 1.0;
+          u.volume = 1.0;
+          speechSynthesis.speak(u);
+        }catch(_){}
+      }
+    };
+
+    function pickPreferredVoice(voices){
+      if(!voices || !voices.length) return null;
+      const tests = [
+        (v)=> /siri/i.test(v.name||''),
+        (v)=> /karen/i.test(v.name||'') && /en-au/i.test(v.lang||''),
+        (v)=> /samantha/i.test(v.name||''),
+        (v)=> /alex/i.test(v.name||''),
+        (v)=> /english/i.test(v.name||'') && /en-au/i.test(v.lang||''),
+        (v)=> /en-au/i.test(v.lang||''),
+        (v)=> /en-gb/i.test(v.lang||''),
+        (v)=> /en-us/i.test(v.lang||'')
+      ];
+      for(const t of tests){
+        const found = voices.find(t);
+        if(found) return found;
+      }
+      return voices[0] || null;
+    }
+
+// ---------- Local storage ----------
+    const LS_KEY='nebo_quiz_lab_v10';
+    function loadState(){ try{ const raw=localStorage.getItem(LS_KEY); return raw?JSON.parse(raw):null; }catch(_){ return null; } }
+    function saveState(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(state)); }catch(_){ } }
+
+    const state = loadState() || {
+      version:'2.0',
+      lastDay: nowISO(),
+      day:{},
+      lifetime:{ quiz:{attempts:0, correct:0}, invaders:{runs:0,best:0}, match:{sets:0, perfect:0}, snake:{runs:0,best:0}, night:{visits:0} },
+      settings:{ quizMode:'scientific', quizOrder:'All', invaderLabel:'family', nightAuto:true, snakeVoice:true },
+      csv:{ loaded:false, filename:'', rows:0 }
+    };
+
+    // Back-compat defaults for older saved states
+    state.settings = state.settings || {};
+    if(state.settings.quizMode==null) state.settings.quizMode='scientific';
+    if(state.settings.quizOrder==null) state.settings.quizOrder='All';
+    if(state.settings.invaderLabel==null) state.settings.invaderLabel='family';
+    if(state.settings.nightAuto==null) state.settings.nightAuto=true;
+    if(state.settings.snakeVoice==null) state.settings.snakeVoice=true;
+
+
+
+    
+
+    // Streak scores (persisted)
+    state.score = state.score || {};
+    if(state.score.quiz==null) state.score.quiz=0;
+    if(state.score.quizBest==null) state.score.quizBest=0;
+    if(state.score.match==null) state.score.match=0;
+    if(state.score.matchBest==null) state.score.matchBest=0;
+
+function bumpDay(){
+      const d=nowISO();
+      if(state.lastDay!==d){ state.lastDay=d; saveState(); }
+      if(!state.day[d]) state.day[d]={quizA:0,quizC:0, invaders:0, match:0, snake:0, night:0};
+      return d;
+    }
+    bumpDay();
+
+    // ---------- CSV parsing ----------
+    const data = {
+      rows:[],
+      headers:[],
+      colMap:{},
+      idx:{any:[], sci:[], fam:[]},
+      uniques:{sci:[], fam:[]},
+      orders:[],
+      idxByOrder:{},   // order -> {any:[], sci:[], fam:[]}
+      uniquesByOrder:{}, // order -> {sci:[], fam:[]}
+
+      badImage:new Set(),
+      keys:{ common:null, date:null, time:null, url:null },
+      nightMap:null,   // {date: [rowIdx,...]}
+      nightDates:[],   // sorted
+    };
+
+    function parseCSV(text){
+      const rows=[];
+      let i=0, field='', row=[], inQuotes=false;
+      const pushField=()=>{ row.push(field); field=''; };
+      const pushRow=()=>{ rows.push(row); row=[]; };
+      while(i < text.length){
+        const c=text[i];
+        if(inQuotes){
+          if(c === '"'){
+            const n=text[i+1];
+            if(n === '"'){ field+='"'; i+=2; continue; }
+            inQuotes=false; i++; continue;
+          }
+          field += c; i++; continue;
+        } else {
+          if(c === '"'){ inQuotes=true; i++; continue; }
+          if(c === ','){ pushField(); i++; continue; }
+          if(c === '\r'){ if(text[i+1]==='\n') i++; pushField(); pushRow(); i++; continue; }
+          if(c === '\n'){ pushField(); pushRow(); i++; continue; }
+          field += c; i++; continue;
+        }
+      }
+      pushField(); pushRow();
+      while(rows.length && rows[rows.length-1].length===1 && rows[rows.length-1][0]==='') rows.pop();
+      return rows;
+    }
+    function normalizeHeader(h){ return safeLower(h).replace(/\s+/g,'_'); }
+    function validateColumns(colMap){
+      const required=['image_url','scientific_name'];
+      const missing=[];
+      for(const k of required) if(colMap[k]==null) missing.push(k);
+      return missing;
+    }
+    function getCol(row, key){
+      const idx=data.colMap[key];
+      if(idx==null) return '';
+      return safeStr(row[idx] ?? '');
+    }
+
+    function detectKeys(){
+      const has = (k)=> (data.colMap[k]!=null);
+
+      // URL
+      const urlCandidates=['url','observation_url','record_url','uri'];
+      data.keys.url = urlCandidates.find(has) || null;
+
+      // Common name
+      const commonCandidates=['common_name','taxon_common_name','preferred_common_name','english_common_name','taxon_common'];
+      data.keys.common = commonCandidates.find(has) || null;
+
+      // Family (needed for Night Walk filtering)
+      const familyCandidates=['taxon_family_name','taxon_family','family','family_name'];
+      data.keys.family = familyCandidates.find(has) || null;
+
+      // Date/time (for Night Walk)
+      const dateCandidates=['observed_on','observed_on_string','time_observed_at','observed_at','created_at','updated_at','datetime'];
+      data.keys.date = dateCandidates.find(has) || null;
+      // time key preference: something likely to include time
+      const timeCandidates=['time_observed_at','observed_at','created_at','updated_at','datetime'];
+      data.keys.time = timeCandidates.find(has) || data.keys.date;
+    }
+
+    function getRecordUrl(row){
+      if(data.keys.url) return getCol(row, data.keys.url).trim();
+      // fallback: sometimes iNat exports have an 'id' but no URL; if so, we can't safely build URL without outside assumptions.
+      return '';
+    }
+    function getCommonName(row){
+      if(!data.keys.common) return '';
+      return getCol(row, data.keys.common).trim();
+    }
+
+    // Date parsing
+    function parseDateVal(raw){
+      const s=safeStr(raw).trim();
+      if(!s) return '';
+      // common formats: YYYY-MM-DD..., YYYY/MM/DD..., ISO...
+      const m1 = s.match(/^(\d{4})[-\/](\d{2})[-\/](\d{2})/);
+      if(m1) return `${m1[1]}-${m1[2]}-${m1[3]}`;
+      // try Date.parse
+      const t = Date.parse(s);
+      if(!Number.isNaN(t)){
+        const d=new Date(t);
+        return d.toISOString().slice(0,10);
+      }
+      return '';
+    }
+    function parseTimeVal(raw){
+      const s=safeStr(raw).trim();
+      if(!s) return NaN;
+      const t=Date.parse(s);
+      if(!Number.isNaN(t)) return t;
+      // try "YYYY-MM-DD HH:MM:SS"
+      const m = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})/);
+      if(m){
+        const t2 = Date.parse(m[1]+'T'+m[2]+':'+m[3]+':00Z');
+        if(!Number.isNaN(t2)) return t2;
+      }
+      return NaN;
+    }
+
+    function buildIndexes(){
+      data.idx.any=[]; data.idx.sci=[]; data.idx.fam=[];
+      data.orders=[]; data.idxByOrder={}; data.uniquesByOrder={};
+
+      const sciSet=new Set(), famSet=new Set();
+      const orderSet=new Set();
+      const sciByOrder=new Map(); // order -> Set
+      const famByOrder=new Map(); // order -> Set
+
+      const hasOrderCol = (data.colMap && data.colMap['taxon_order_name']!=null);
+
+      for(let r=0;r<data.rows.length;r++){
+        const row=data.rows[r];
+        const url=getCol(row,'image_url').trim();
+        if(!url) continue;
+
+        const sci=getCol(row,'scientific_name').trim();
+        const fam=getCol(row,'taxon_family_name').trim();
+
+        data.idx.any.push(r);
+
+        let ord = '';
+        if(hasOrderCol){
+          ord = getCol(row,'taxon_order_name').trim();
+          if(ord){
+            orderSet.add(ord);
+            if(!data.idxByOrder[ord]) data.idxByOrder[ord] = {any:[], sci:[], fam:[]};
+            data.idxByOrder[ord].any.push(r);
+          }
+        }
+
+        if(sci){
+          data.idx.sci.push(r);
+          sciSet.add(sci);
+          if(ord){
+            data.idxByOrder[ord].sci.push(r);
+            if(!sciByOrder.has(ord)) sciByOrder.set(ord, new Set());
+            sciByOrder.get(ord).add(sci);
+          }
+        }
+        if(fam){
+          data.idx.fam.push(r);
+          famSet.add(fam);
+          if(ord){
+            data.idxByOrder[ord].fam.push(r);
+            if(!famByOrder.has(ord)) famByOrder.set(ord, new Set());
+            famByOrder.get(ord).add(fam);
+          }
+        }
+      }
+
+      data.uniques.sci=Array.from(sciSet);
+      data.uniques.fam=Array.from(famSet);
+
+      data.orders = Array.from(orderSet).sort((a,b)=>a.localeCompare(b));
+
+      // Convert per-order uniques to arrays (for fast quiz distractor sampling)
+      for(const o of data.orders){
+        data.uniquesByOrder[o] = {
+          sci: Array.from(sciByOrder.get(o) || []).sort((a,b)=>a.localeCompare(b)),
+          fam: Array.from(famByOrder.get(o) || []).sort((a,b)=>a.localeCompare(b))
+        };
+      }
+    }
+
+    function buildNightIndex(){
+      data.nightMap=null;
+      data.nightDates=[];
+      if(!data.keys.date) return;
+
+      const map=new Map();
+      for(let i=0;i<data.rows.length;i++){
+        const row=data.rows[i];
+        const url=getCol(row,'image_url').trim();
+        if(!url || data.badImage.has(url)) continue;
+        const raw = getCol(row, data.keys.date);
+        const day = parseDateVal(raw);
+        if(!day) continue;
+        if(!map.has(day)) map.set(day, []);
+        map.get(day).push(i);
+      }
+      // only keep dates with at least 3 records that have both image and scientific name
+      const dates = Array.from(map.keys()).filter(d =>
+        map.get(d).filter(idx => !!getCol(data.rows[idx],'scientific_name').trim()).length >= 3
+      ).sort();
+      dates.reverse(); // latest first
+      data.nightDates = dates;
+      data.nightMap = {};
+      for(const d0 of dates) data.nightMap[d0]=map.get(d0);
+    }
+
+    // ---------- Images ----------
+    const imgCache=new Map();
+    const IMG_CACHE_MAX = 260;
+
+    // Throttled image loading — max 6 concurrent fetches
+    const _imgQueue = [];
+    let _imgActive = 0;
+    const IMG_CONCURRENCY = 6;
+
+    function _pumpImageQueue(){
+      while(_imgActive < IMG_CONCURRENCY && _imgQueue.length > 0){
+        const {rec, u} = _imgQueue.shift();
+        _imgActive++;
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = ()=>{
+          rec.ok = true; rec.ready = true; rec.img = img;
+          _imgActive--;
+          _pumpImageQueue();
+        };
+        img.onerror = ()=>{
+          rec.ok = false; rec.ready = true; data.badImage.add(u);
+          _imgActive--;
+          _pumpImageQueue();
+        };
+        img.src = u;
+      }
+    }
+
+    function loadImage(url){
+      const u = safeStr(url||'');
+      if(!u) return {img:null, ok:false, ready:true};
+      if(imgCache.has(u)){
+        const rec = imgCache.get(u);
+        imgCache.delete(u);
+        imgCache.set(u, rec); // LRU bump
+        return rec;
+      }
+      const rec={img:null, ok:false, ready:false};
+      imgCache.set(u, rec);
+      _imgQueue.push({rec, u});
+      _pumpImageQueue();
+
+      while(imgCache.size > IMG_CACHE_MAX){
+        const firstKey = imgCache.keys().next().value;
+        if(firstKey==null) break;
+        imgCache.delete(firstKey);
+      }
+      return rec;
+    }
+
+    // ---------- File input ----------
+    const fileInput=document.getElementById('fileInput');
+    fileInput.addEventListener('change', (e)=>{
+      const f=e.target.files && e.target.files[0];
+      if(f) handleCSVFile(f);
+      fileInput.value='';
+    });
+
+    function handleCSVFile(file){
+      const reader=new FileReader();
+      reader.onerror=()=> toast('Could not read file.', 'warn', 4200);
+      reader.onload=()=>{
+        try{
+          const text=safeStr(reader.result||'');
+          const grid=parseCSV(text);
+          if(grid.length<2){ toast('CSV parsed but looks empty.', 'warn', 5000); return; }
+          const headers=grid[0].map(h=>safeStr(h));
+          const colMap={};
+          for(let i=0;i<headers.length;i++) colMap[normalizeHeader(headers[i])] = i;
+          const missing=validateColumns(colMap);
+          if(missing.length){ toast('Missing required columns: '+missing.join(', '), 'warn', 7000); return; }
+
+          data.headers=headers;
+          data.colMap=colMap;
+          data.rows=grid.slice(1);
+          data.badImage.clear();
+          imgCache.clear();
+          circleCache.clear();
+
+          detectKeys();
+          buildIndexes();
+          buildNightIndex();
+
+          state.csv.loaded=true;
+          state.csv.filename=file.name;
+          state.csv.rows=data.rows.length;
+          saveState();
+
+          quiz.newQuestion();
+          match.reset(true);
+          invaders.reset(true);
+          snake.reset(true);
+          night.reset(true);
+
+          toast(`Loaded ${file.name} (${data.rows.length} rows).`, 'ok', 3200);
+          goto('home');
+        }catch(err){
+          toast('CSV load failed: '+safeStr(err), 'warn', 7000);
+        }
+      };
+      reader.readAsText(file);
+    }
+
+    // ---------- Clean night sky background ----------
+    const sky = { stars: [], moths: [], fireflies: [], t: 0 };
+    function initSky(){
+      sky.stars.length=0;
+      sky.moths.length=0;
+      sky.fireflies.length=0;
+      const nStars = Math.floor(clamp((W*H)/26000, 18, 90));
+      for(let i=0;i<nStars;i++){
+        sky.stars.push({
+          x: Math.random()*W, y: Math.random()*H,
+          r: Math.random()*1.4 + 0.2,
+          a: Math.random()*0.35 + 0.10,
+          tw: Math.random()*1.8 + 0.3,
+          ph: Math.random()*Math.PI*2
+        });
+      }
+      const nMoths = 0;
+      for(let i=0;i<nMoths;i++){
+        sky.moths.push({
+          x: Math.random()*W, y: Math.random()*H*0.8,
+          vx: (Math.random()-0.5)*16,
+          vy: (Math.random()-0.5)*9,
+          s: Math.random()*0.7 + 0.5,
+          a: Math.random()*0.12 + 0.03,
+          ph: Math.random()*Math.PI*2
+        });
+      }
+      // Calm fireflies (soft neon-green, blinking at different depths)
+      const nFire = Math.floor(clamp((W*H)/28000, 40, 120));
+      for(let i=0;i<nFire;i++){
+        const depth = Math.pow(Math.random(), 1.25); // 0 near, 1 far
+        const x = Math.random()*W;
+        // bias y lower to feel like a forest understory
+        const y = H*(0.12 + Math.pow(Math.random(), 1.9)*0.88);
+        const r = lerp(0.9, 2.8, 1-depth);
+        const baseA = lerp(0.10, 0.55, 1-depth);
+        const tw = lerp(0.25, 0.85, Math.random()) * lerp(0.65, 1.25, 1-depth); // slow blink
+        const ph = Math.random()*Math.PI*2;
+        const drift = (Math.random()*2-1) * lerp(0.05, 0.55, 1-depth);
+        const driftY = (Math.random()*2-1) * lerp(0.02, 0.18, 1-depth);
+        sky.fireflies.push({x,y,r,baseA,tw,ph,depth,drift,driftY});
+      }
+    }
+    function drawSky(dt){
+      sky.t += dt;
+      ctx.fillStyle = getSkyGradient();
+      ctx.fillRect(0,0,W,H);
+
+      for(const s of sky.stars){
+        const tw = 0.65 + 0.35*Math.sin(s.ph + sky.t*s.tw);
+        ctx.beginPath();
+        ctx.arc(s.x,s.y,s.r*tw,0,Math.PI*2);
+        ctx.fillStyle='rgba(255,255,255,'+(s.a*0.55*tw)+')';
+        ctx.fill();
+      }
+
+      // fireflies — pre-rendered glow sprite, no shadowBlur
+      const glowSprite = getFireflyGlow();
+      ctx.save();
+      ctx.globalCompositeOperation='lighter';
+      for(const f of sky.fireflies){
+        const s = Math.sin(f.ph + sky.t*f.tw);
+        const blink = 0.35 + 0.65*Math.max(0, s);
+        const a = f.baseA * blink;
+
+        const x = f.x + Math.sin(f.ph + sky.t*0.22)*f.drift;
+        const y = f.y + Math.cos(f.ph*0.8 + sky.t*0.18)*f.driftY;
+
+        if(a < 0.03) continue;
+
+        const sz = f.r * (3.2 + 1.6*blink); // glow radius
+        ctx.globalAlpha = a;
+        ctx.drawImage(glowSprite, x - sz, y - sz, sz*2, sz*2);
+      }
+      ctx.restore();
+
+      ctx.fillStyle = getVignetteGradient();
+      ctx.fillRect(0,0,W,H);
+    }
+
+    // ---------- Text helpers ----------
+    function wrapText(text, maxWidth, font){
+      const t = safeStr(text);
+      const words = t.split(/\s+/).filter(Boolean);
+      if(!words.length) return [''];
+      const lines=[];
+      const prev = ctx.font;
+      if(font) ctx.font = font;
+      let line = words[0];
+      for(let i=1;i<words.length;i++){
+        const test = line + ' ' + words[i];
+        if(ctx.measureText(test).width <= maxWidth) line = test;
+        else { lines.push(line); line = words[i]; }
+      }
+      lines.push(line);
+      if(font) ctx.font = prev;
+      return lines;
+    }
+
+    function drawTitle(x,y,main,sub){
+      const accent = sceneColors[scene] || palette.green;
+      ctx.fillStyle='rgba(255,255,255,0.96)';
+      ctx.font='800 36px Barlow, sans-serif';
+      ctx.textAlign='left'; ctx.textBaseline='top';
+      ctx.fillText(main, x, y);
+      // accent underline
+      const tw = ctx.measureText(main).width;
+      ctx.fillStyle = hexToRgba(accent, 0.7);
+      roundRect(x, y+44, Math.min(tw, 120), 3, 1.5);
+      ctx.fill();
+      ctx.fillStyle='rgba(255,255,255,0.60)';
+      ctx.font='400 15px Barlow, sans-serif';
+      ctx.fillText(sub, x, y+54);
+    }
+    function drawBodyText(x,y,lines){
+      ctx.fillStyle='rgba(255,255,255,0.76)';
+      ctx.font='400 15px Barlow, sans-serif';
+      ctx.textAlign='left'; ctx.textBaseline='top';
+      const lh=20;
+      for(let i=0;i<lines.length;i++) ctx.fillText(lines[i], x, y+i*lh);
+    }
+    function drawButton(b){
+      if(b.opts && (b.opts.hidden || b.opts.ghost)) return;
+      const hover=hitBtn(b, ui.pointer.x, ui.pointer.y);
+      const r=(b.opts && b.opts.r!=null) ? b.opts.r : 14;
+      const accent = (b.opts && b.opts.accent) ? b.opts.accent : null;
+      const isPrimary = (b.opts && b.opts.primary);
+      const _scale = (b.opts && b.opts.scale && b.opts.scale !== 1) ? b.opts.scale : null;
+      if(_scale){ const _cx=b.x+b.w/2, _cy=b.y+b.h/2; ctx.save(); ctx.translate(_cx,_cy); ctx.scale(_scale,_scale); ctx.translate(-_cx,-_cy); }
+
+      roundRect(b.x,b.y,b.w,b.h,r);
+
+      if(accent){
+        const base = hover ? 0.28 : 0.18;
+        ctx.fillStyle = hexToRgba(accent, base);
+        ctx.fill();
+        ctx.strokeStyle = hexToRgba(accent, hover ? 0.55 : 0.35);
+        ctx.lineWidth=1.5;
+        ctx.stroke();
+        ctx.lineWidth=1;
+        // accent bar on the left
+        if(b.h > 44){
+          roundRect(b.x, b.y, 4, b.h, 2);
+          ctx.fillStyle = hexToRgba(accent, hover ? 0.9 : 0.65);
+          ctx.fill();
+        }
+      } else {
+        const base= isPrimary ? 0.16 : 0.10;
+        const hov = isPrimary ? 0.22 : 0.15;
+        ctx.fillStyle= hover ? ('rgba(255,255,255,'+hov+')') : ('rgba(255,255,255,'+base+')');
+        ctx.fill();
+        ctx.strokeStyle=hover ? 'rgba(255,255,255,0.32)' : 'rgba(255,255,255,0.18)';
+        ctx.lineWidth=1;
+        ctx.stroke();
+      }
+      if(b.label){
+        ctx.fillStyle= accent ? (hover ? 'rgba(255,255,255,0.97)' : 'rgba(255,255,255,0.90)') : 'rgba(255,255,255,0.93)';
+        const fs=(b.opts && b.opts.fontSize) ? b.opts.fontSize : 16;
+        const weight = (b.opts && b.opts.fontWeight) ? b.opts.fontWeight : '600';
+        ctx.font=weight+' '+fs+'px Barlow, sans-serif';
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(b.label, b.x+b.w/2, b.y+b.h/2);
+      }
+      if(_scale) ctx.restore();
+    }
+    function drawPill(x,y,text){
+      ctx.font='500 13px Barlow, sans-serif';
+      const padX=10;
+      const tw=ctx.measureText(text).width;
+      const w=tw+padX*2, h=26;
+      roundRect(x,y,w,h,999);
+      ctx.fillStyle=hexToRgba(sceneColors[scene]||palette.green, 0.08); ctx.fill();
+      ctx.strokeStyle=hexToRgba(sceneColors[scene]||palette.green, 0.22); ctx.lineWidth=1; ctx.stroke();
+      ctx.fillStyle='rgba(255,255,255,0.80)';
+      ctx.textAlign='left'; ctx.textBaseline='middle';
+      ctx.fillText(text, x+padX, y+h/2);
+      return {w,h};
+    }
+
+    function drawPillRight(xRight,y,text){
+      ctx.font='500 13px Barlow, sans-serif';
+      const padX=10;
+      const tw=ctx.measureText(text).width;
+      const w=tw+padX*2, h=26;
+      const x = xRight - w;
+      roundRect(x,y,w,h,999);
+      ctx.fillStyle=hexToRgba(sceneColors[scene]||palette.green, 0.08); ctx.fill();
+      ctx.strokeStyle=hexToRgba(sceneColors[scene]||palette.green, 0.22); ctx.lineWidth=1; ctx.stroke();
+      ctx.fillStyle='rgba(255,255,255,0.80)';
+      ctx.textAlign='left'; ctx.textBaseline='middle';
+      ctx.fillText(text, x+padX, y+h/2);
+      return {x,w,h};
+    }
+
+
+    // ---------- Fullscreen ----------
+    function toggleFullscreen(){
+      if(!document.fullscreenElement){
+        document.documentElement.requestFullscreen().catch(()=>{});
+      } else {
+        document.exitFullscreen().catch(()=>{});
+      }
+    }
+
+    // ---------- Idle auto-return ----------
+    let lastInteraction = performance.now();
+    const IDLE_MS = 5 * 60 * 1000;
+    function touchInteraction(){ lastInteraction = performance.now(); }
+
+    // ---------- Scene control ----------
+    let scene='home';
+    function goto(name){
+      scene=name;
+      showHelp=false;
+      paused=false;
+      ui.pointer.clicked=false;
+      saveState();
+    }
+
+    // ---------- Top Bar ----------
+    function drawTopBar(pad){
+      addButton(pad, pad+86, 140, 44, '← Home', ()=>goto('home'), {fontSize:15, r:12, accent:sceneColors[scene]});
+      addButton(pad+152, pad+86, 44, 44, '?', ()=>{ showHelp = !showHelp; }, {fontSize:18, r:12, fontWeight:'700'});
+      const _fsLabel = document.fullscreenElement ? '⊟' : '⊞';
+      addButton(pad+208, pad+86, 44, 44, _fsLabel, ()=>toggleFullscreen(), {fontSize:17, r:12});
+    }
+
+    // ---------- Help modal ----------
+    function getSceneShortcuts(){
+      const global = [
+        ['Esc', 'Return home'],
+        ['P', 'Pause / Resume'],
+        ['F', 'Toggle fullscreen'],
+        ['?', 'Toggle this help'],
+      ];
+      const perScene = {
+        quiz: [
+          ['N', 'Next question'],
+          ['M', 'Toggle mode (Scientific / Family)'],
+        ],
+        match: [
+          ['Drag', 'Drag labels onto matching specimens'],
+        ],
+        invaders: [
+          ['Space / Enter', 'Fire'],
+          ['← →', 'Move camera ship'],
+          ['R', 'Restart wave'],
+          ['I', 'Toggle label mode'],
+          ['Hold L', 'Scan — reveal names on enemies'],
+        ],
+        snake: [
+          ['← → ↑ ↓', 'Steer the snake'],
+          ['R', 'Restart game'],
+        ],
+        night: [
+          ['← →', 'Previous / next date'],
+          ['Space', 'Toggle auto-advance'],
+        ],
+      };
+      return { global, scene: perScene[scene] || [] };
+    }
+
+    function drawHelpModal(){
+      if(!showHelp) return;
+
+      const shortcuts = getSceneShortcuts();
+      const accent = sceneColors[scene] || palette.green;
+
+      // Backdrop
+      ctx.fillStyle = 'rgba(0,0,0,0.65)';
+      ctx.fillRect(0, 0, W, H);
+
+      const modalW = clamp(W * 0.36, 300, 440);
+      const rowH = 34;
+      const headerH = 50;
+      const sectionGap = 28;
+      const dividerH = 20;
+      const totalRows = shortcuts.global.length + shortcuts.scene.length;
+      const hasSectionLabel = shortcuts.scene.length > 0;
+      const contentH = headerH + totalRows * rowH + (hasSectionLabel ? sectionGap + dividerH : 0) + 24;
+      const modalH = Math.min(contentH, H * 0.8);
+      const mx = Math.round((W - modalW) / 2);
+      const my = Math.round((H - modalH) / 2);
+
+      // Panel
+      roundRect(mx, my, modalW, modalH, 20);
+      ctx.fillStyle = 'rgba(8,10,18,0.98)'; ctx.fill();
+      ctx.strokeStyle = hexToRgba(accent, 0.25); ctx.lineWidth = 1; ctx.stroke();
+
+      // Header
+      ctx.fillStyle = hexToRgba(accent, 0.92);
+      ctx.font = '800 16px Barlow, sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText('Keyboard Shortcuts', mx + 22, my + headerH / 2);
+
+      // Close
+      addButton(mx + modalW - 44, my + 12, 32, 32, '✕', ()=>{ showHelp=false; }, {fontSize:14, r:8});
+
+      // Divider
+      ctx.fillStyle = hexToRgba(accent, 0.12);
+      ctx.fillRect(mx + 16, my + headerH - 1, modalW - 32, 1);
+
+      let cy = my + headerH + 8;
+
+      // Scene-specific shortcuts first (if any)
+      if(shortcuts.scene.length > 0){
+        const sceneName = {quiz:'Quiz', match:'Sorting Table', invaders:'Sheet Invaders', snake:'Specimen Snake', night:'Night Walk'}[scene] || scene;
+        ctx.fillStyle = hexToRgba(accent, 0.65);
+        ctx.font = '700 11px Barlow, sans-serif';
+        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.fillText(sceneName.toUpperCase(), mx + 22, cy + 6);
+        cy += 20;
+
+        for(const [key, desc] of shortcuts.scene){
+          drawShortcutRow(mx, cy, modalW, key, desc, accent);
+          cy += rowH;
+        }
+
+        cy += 8;
+        ctx.fillStyle = 'rgba(255,255,255,0.06)';
+        ctx.fillRect(mx + 22, cy, modalW - 44, 1);
+        cy += 12;
+
+        ctx.fillStyle = 'rgba(255,255,255,0.30)';
+        ctx.font = '700 11px Barlow, sans-serif';
+        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.fillText('GLOBAL', mx + 22, cy + 6);
+        cy += 20;
+      }
+
+      for(const [key, desc] of shortcuts.global){
+        drawShortcutRow(mx, cy, modalW, key, desc, accent);
+        cy += rowH;
+      }
+
+      // Dismiss backdrop
+      addButton(0, 0, W, H, '', ()=>{ showHelp=false; }, {ghost:true});
+    }
+
+    function drawShortcutRow(mx, y, mw, key, desc, accent){
+      // Key badge
+      ctx.font = '700 12px Barlow, sans-serif';
+      const keyW = Math.max(36, ctx.measureText(key).width + 18);
+      const badgeX = mx + 22;
+      const badgeY = y + 4;
+      const badgeH = 24;
+
+      roundRect(badgeX, badgeY, keyW, badgeH, 6);
+      ctx.fillStyle = hexToRgba(accent, 0.12); ctx.fill();
+      ctx.strokeStyle = hexToRgba(accent, 0.25); ctx.lineWidth = 1; ctx.stroke();
+
+      ctx.fillStyle = hexToRgba(accent, 0.92);
+      ctx.font = '700 12px Barlow, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(key, badgeX + keyW / 2, badgeY + badgeH / 2);
+
+      // Description
+      ctx.fillStyle = 'rgba(255,255,255,0.72)';
+      ctx.font = '400 13px Barlow, sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(desc, badgeX + keyW + 14, badgeY + badgeH / 2);
+    }
+
+    // ---------- Scroll Picker Modal ----------
+    // Generic scrollable modal list picker used by Quiz (order), Night (date + family).
+    // cfg: { list, modalW, scrollOwner, scrollKey, onClose, title, countLabel,
+    //        accent, isCurrent(item,idx), getLabel(item,idx), getCount(item,idx)|null, onSelect(item,idx) }
+    function drawScrollPicker(cfg){
+      clearButtons();
+
+      if(ui.wheel){
+        cfg.scrollOwner[cfg.scrollKey] = (cfg.scrollOwner[cfg.scrollKey]||0) + ui.wheel * 0.6;
+      }
+
+      const list     = cfg.list;
+      const accent   = cfg.accent;
+      const modalW   = cfg.modalW;
+      const modalMaxH = clamp(H * 0.72, 300, 600);
+      const rowH     = 42;
+      const headerH  = 56;
+      const footerH  = 12;
+      const listH    = modalMaxH - headerH - footerH;
+      const contentH = list.length * rowH;
+      const maxScroll = Math.max(0, contentH - listH);
+
+      cfg.scrollOwner[cfg.scrollKey] = clamp(cfg.scrollOwner[cfg.scrollKey]||0, 0, maxScroll);
+
+      const mx = Math.round((W - modalW) / 2);
+      const my = Math.round((H - modalMaxH) / 2);
+
+      // Backdrop
+      ctx.fillStyle = 'rgba(0,0,0,0.65)';
+      ctx.fillRect(0, 0, W, H);
+      addButton(0, 0, W, H, '', cfg.onClose, {ghost:true});
+
+      // Panel
+      roundRect(mx, my, modalW, modalMaxH, 20);
+      ctx.fillStyle = 'rgba(8,10,18,0.98)'; ctx.fill();
+      ctx.strokeStyle = hexToRgba(accent, 0.25); ctx.lineWidth = 1; ctx.stroke();
+
+      // Header title
+      ctx.fillStyle = hexToRgba(accent, 0.92);
+      ctx.font = '800 15px Barlow, sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(cfg.title, mx + 20, my + headerH/2 - 2);
+
+      // Count label (top-right)
+      ctx.fillStyle = 'rgba(255,255,255,0.35)';
+      ctx.font = '500 12px Barlow, sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(cfg.countLabel, mx + modalW - 50, my + headerH/2 - 2);
+
+      // Close button
+      addButton(mx + modalW - 44, my + 12, 32, 32, '✕', cfg.onClose, {fontSize:14, r:8});
+
+      // Divider
+      ctx.fillStyle = hexToRgba(accent, 0.12);
+      ctx.fillRect(mx + 16, my + headerH - 1, modalW - 32, 1);
+
+      // Clipped list
+      const listX = mx;
+      const listY  = my + headerH;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(listX, listY, modalW, listH);
+      ctx.clip();
+
+      const scrollPx = cfg.scrollOwner[cfg.scrollKey] || 0;
+      const startI   = Math.floor(scrollPx / rowH);
+      const yOff     = -(scrollPx % rowH);
+
+      for(let i = 0; i <= Math.ceil(listH / rowH) + 1; i++){
+        const idx  = startI + i;
+        if(idx >= list.length) break;
+        const item = list[idx];
+        const isCur = cfg.isCurrent(item, idx);
+        const rowY  = listY + i * rowH + yOff;
+        if(rowY + rowH < listY || rowY > listY + listH) continue;
+
+        if(isCur){
+          roundRect(listX + 10, rowY + 3, modalW - 20, rowH - 6, 10);
+          ctx.fillStyle = hexToRgba(accent, 0.14); ctx.fill();
+          ctx.strokeStyle = hexToRgba(accent, 0.30); ctx.lineWidth = 1; ctx.stroke();
+          roundRect(listX + 10, rowY + 3, 3, rowH - 6, 2);
+          ctx.fillStyle = hexToRgba(accent, 0.8); ctx.fill();
+        }
+
+        // Label
+        ctx.fillStyle = isCur ? hexToRgba(accent, 0.95) : 'rgba(255,255,255,0.78)';
+        ctx.font = isCur ? '700 14px Barlow, sans-serif' : '500 14px Barlow, sans-serif';
+        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.fillText(cfg.getLabel(item, idx), listX + 24, rowY + rowH/2);
+
+        // Count badge (optional)
+        if(cfg.getCount){
+          const badge = cfg.getCount(item, idx);
+          if(badge != null){
+            ctx.fillStyle = isCur ? hexToRgba(accent, 0.55) : 'rgba(255,255,255,0.28)';
+            ctx.font = '500 12px Barlow, sans-serif';
+            ctx.textAlign = 'right';
+            ctx.fillText(badge, listX + modalW - 22, rowY + rowH/2);
+          }
+        }
+
+        // Hit area
+        addButton(listX + 6, rowY + 1, modalW - 12, rowH - 2, '', ()=>cfg.onSelect(item, idx), {ghost:true});
+      }
+
+      ctx.restore();
+
+      // Scrollbar track + thumb
+      if(contentH > listH){
+        const trackX = mx + modalW - 6;
+        const trackH = listH - 8;
+        const thumbH = Math.max(24, (listH / contentH) * trackH);
+        const thumbY = listY + 4 + (scrollPx / maxScroll) * (trackH - thumbH);
+        roundRect(trackX, listY + 4, 3, trackH, 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fill();
+        roundRect(trackX, thumbY, 3, thumbH, 2);
+        ctx.fillStyle = hexToRgba(accent, 0.35); ctx.fill();
+      }
+
+      // Fade edges
+      const fadeH = 18;
+      if(scrollPx > 2){
+        const gTop = ctx.createLinearGradient(0, listY, 0, listY + fadeH);
+        gTop.addColorStop(0, 'rgba(8,10,18,0.95)');
+        gTop.addColorStop(1, 'rgba(8,10,18,0)');
+        ctx.fillStyle = gTop;
+        ctx.fillRect(mx, listY, modalW - 8, fadeH);
+      }
+      if(scrollPx < maxScroll - 2){
+        const gBot = ctx.createLinearGradient(0, listY + listH - fadeH, 0, listY + listH);
+        gBot.addColorStop(0, 'rgba(8,10,18,0)');
+        gBot.addColorStop(1, 'rgba(8,10,18,0.95)');
+        ctx.fillStyle = gBot;
+        ctx.fillRect(mx, listY + listH - fadeH, modalW - 8, fadeH);
+      }
+    }
+
+    // ---------- Quiz ----------
+    function quizToLarge(url){
+      // iNaturalist image URLs include a size token (e.g. /medium.jpg). We only want to upscale for Quiz.
+      const u = safeStr(url).trim();
+      if(!u) return '';
+      // Replace the terminal "/medium.<ext>" with "/large.<ext>"
+      const v = u.replace(/\/medium(\.[a-z0-9]+)(\?.*)?$/i, '/large$1$2');
+      return v || u;
+    }
+    const quiz = {
+      current:null,
+
+      // UI state (not persisted)
+      orderPicker:false,
+      orderScroll:0,
+
+      toggleMode(){
+        state.settings.quizMode = (state.settings.quizMode==='family') ? 'scientific' : 'family';
+        saveState();
+        this.newQuestion();
+        toast('Quiz mode: '+(state.settings.quizMode==='family'?'Family':'Scientific'), 'info', 1200);
+      },
+
+      toggleOrderPicker(){
+        const hasOrderCol = (data.colMap && data.colMap['taxon_order_name']!=null);
+        if(!hasOrderCol || !data.orders || !data.orders.length){
+          toast('No taxon_order_name data to filter by.', 'info', 1800);
+          this.orderPicker=false;
+          return;
+        }
+        this.orderPicker = !this.orderPicker;
+        if(this.orderPicker){
+          const cur = state.settings.quizOrder || 'All';
+          const list = ['All'].concat(data.orders);
+          const idx = Math.max(0, list.indexOf(cur));
+          // Center the current order in the visible area (pixel scroll)
+          this._scrollPx = Math.max(0, idx * 42 - 160);
+        }
+      },
+
+      setOrder(ord){
+        const hasOrderCol = (data.colMap && data.colMap['taxon_order_name']!=null);
+        if(!hasOrderCol) return toast('No order column found in this CSV.', 'info', 1600);
+        const o = ord || 'All';
+        state.settings.quizOrder = o;
+        saveState();
+        this.orderPicker=false;
+        this.newQuestion();
+        toast('Quiz order: '+(o==='All'?'All orders':o), 'info', 1400);
+      },
+
+      getPool(mode, ord){
+        const m = mode || state.settings.quizMode || 'scientific';
+        const o = ord || state.settings.quizOrder || 'All';
+        const wantFam = (m==='family');
+
+        if(o==='All') return wantFam ? data.idx.fam : data.idx.sci;
+
+        if(data.idxByOrder && data.idxByOrder[o]){
+          return wantFam ? (data.idxByOrder[o].fam || []) : (data.idxByOrder[o].sci || []);
+        }
+        return wantFam ? data.idx.fam : data.idx.sci;
+      },
+
+      getUniverse(mode, ord){
+        const m = mode || state.settings.quizMode || 'scientific';
+        const o = ord || state.settings.quizOrder || 'All';
+        const wantFam = (m==='family');
+
+        if(o!=='All' && data.uniquesByOrder && data.uniquesByOrder[o]){
+          const u = wantFam ? data.uniquesByOrder[o].fam : data.uniquesByOrder[o].sci;
+          if(u && u.length>=4) return u;
+        }
+        return wantFam ? data.uniques.fam : data.uniques.sci;
+      },
+
+      newQuestion(){
+        const mode = state.settings.quizMode || 'scientific';
+        const ord = state.settings.quizOrder || 'All';
+
+        const pool = this.getPool(mode, ord);
+        if(!pool || pool.length < 4){
+          const msg = (ord!=='All')
+            ? `Not enough records in ${ord} for quiz (need ≥ 4 usable rows). Try “All orders” or another order.`
+            : 'Not enough records for quiz (need ≥ 4 usable rows).';
+          this.current={error: msg};
+          return;
+        }
+
+        const rowIdx=pickValidRow(pool, 900);
+        if(rowIdx==null){ this.current={error:'Could not find a usable image_url.'}; return; }
+
+        const row=data.rows[rowIdx];
+        const urlMed=getCol(row,'image_url').trim();
+        const url=quizToLarge(urlMed) || urlMed;
+        const sci=getCol(row,'scientific_name').trim();
+        const fam=getCol(row,'taxon_family_name').trim();
+        const correct=(mode==='family') ? fam : sci;
+
+        if(!correct){
+          // rare but possible: pool drift; just try again
+          data.badImage.add(url);
+          return this.newQuestion();
+        }
+
+        const universe = this.getUniverse(mode, ord);
+        const distract=[];
+        let a=0;
+        while(distract.length<3 && a++<2200){
+          const cand=choose(universe);
+          if(!cand || cand===correct) continue;
+          if(distract.includes(cand)) continue;
+          distract.push(cand);
+        }
+
+        // As a fallback (tiny orders), allow global universe for distractors
+        if(distract.length<3){
+          const global = (mode==='family') ? data.uniques.fam : data.uniques.sci;
+          let b=0;
+          while(distract.length<3 && b++<2200){
+            const cand=choose(global);
+            if(!cand || cand===correct) continue;
+            if(distract.includes(cand)) continue;
+            distract.push(cand);
+          }
+        }
+
+        const choices=distract.concat([correct]);
+        for(let i=choices.length-1;i>0;i--){ const j=rnd(i+1); [choices[i],choices[j]]=[choices[j],choices[i]]; }
+
+        this.current={
+          mode, order:ord,
+          idx:rowIdx, url, urlMed, sci, fam, correct, choices,
+          picked:null, pickTime:null,
+          _fallbackTried:false,
+          img:loadImage(url)
+        };
+      },
+
+      record(ok){
+        const d=bumpDay();
+        state.lifetime.quiz.attempts++; state.day[d].quizA++;
+        if(ok){ state.lifetime.quiz.correct++; state.day[d].quizC++; }
+
+        // Streak scoring (Quiz)
+        if(!state.score) state.score={quiz:0, quizBest:0, match:0, matchBest:0};
+        if(ok){
+          state.score.quiz = (state.score.quiz||0) + 10;
+          state.score.quizBest = Math.max(state.score.quizBest||0, state.score.quiz);
+        } else {
+          state.score.quiz = 0;
+        }
+
+        saveState();
+      }
+    };
+
+
+    // ---------- Matching module ----------
+    const match = {
+      set:null,
+      draggables:[],
+      slots:[],
+      reset(full=false){
+        this.set=null; this.draggables=[]; this.slots=[];
+        if(state.csv.loaded) this.newSet();
+      },
+      newSet(){
+        const picks=[];
+        let tries=0;
+        while(picks.length<3 && tries++<3000){
+          const idx = data.idx.sci.length ? data.idx.sci[rnd(data.idx.sci.length)] : null;
+          if(idx==null) break;
+          if(picks.includes(idx)) continue;
+          const row=data.rows[idx];
+          const url=getCol(row,'image_url').trim();
+          const sci=getCol(row,'scientific_name').trim();
+          const fam=getCol(row,'taxon_family_name').trim();
+          if(!url || !sci || data.badImage.has(url)) continue;
+          picks.push(idx);
+        }
+        if(picks.length<3){ this.set={error:'Not enough usable rows for Matching.'}; return; }
+
+        const items=picks.map(idx=>{
+          const row=data.rows[idx];
+          return {
+            idx, row,
+            url:getCol(row,'image_url').trim(),
+            sci:getCol(row,'scientific_name').trim(),
+            fam:getCol(row,'taxon_family_name').trim() || '(no family)',
+            img:loadImage(getCol(row,'image_url').trim())
+          };
+        });
+        this.set={items, done:false, perfect:false};
+
+        const dr=[];
+        for(let i=0;i<3;i++){
+          dr.push({id:'sci'+i, kind:'sci', text:items[i].sci});
+          dr.push({id:'fam'+i, kind:'fam', text:items[i].fam});
+        }
+        for(let i=dr.length-1;i>0;i--){ const j=rnd(i+1); [dr[i],dr[j]]=[dr[j],dr[i]]; }
+        this.draggables = dr.map((d,k)=>({ ...d, x:0,y:0,w:0,h:0, homeX:0, homeY:0, placed:null, order:k, homeSet:false }));
+
+        const slots=[];
+        for(let i=0;i<3;i++){
+          slots.push({id:'slot_sci_'+i, imgIdx:i, kind:'sci', expectsText:items[i].sci, holds:null, x:0,y:0,w:0,h:0});
+          slots.push({id:'slot_fam_'+i, imgIdx:i, kind:'fam', expectsText:items[i].fam, holds:null, x:0,y:0,w:0,h:0});
+        }
+        this.slots=slots;
+      },
+      layout(){
+        const pad=Math.max(18, Math.min(44, W*0.05));
+        const top=pad+138;
+        const cardW=Math.min(360, (W - pad*2 - 24)/3);
+        const cardH=Math.min(320, H*0.36);
+        const gap=Math.max(12, (W - pad*2 - cardW*3)/2);
+
+        for(let i=0;i<3;i++){
+          const cx=pad + i*(cardW+gap);
+          const cy=top;
+          const slotW=cardW;
+          const slotH=52;
+          const s1=this.slots.find(s=>s.imgIdx===i && s.kind==='sci');
+          const s2=this.slots.find(s=>s.imgIdx===i && s.kind==='fam');
+          if(s1){ s1.x=cx; s1.y=cy+cardH+12; s1.w=slotW; s1.h=slotH; }
+          if(s2){ s2.x=cx; s2.y=cy+cardH+12+slotH+12; s2.w=slotW; s2.h=slotH; }
+        }
+
+        const bankTop=top + cardH + 12 + 52 + 12 + 52 + 22;
+        const bankW = W - pad*2;
+        const cols=2;
+        const rowH=56;
+        const bw=(bankW - (cols-1)*14)/cols;
+
+        let unplaced=this.draggables.filter(d=>!d.placed);
+        for(let i=0;i<unplaced.length;i++){
+          const d=unplaced[i];
+          const r=Math.floor(i/cols);
+          const c=i%cols;
+          const x=pad + c*(bw+14);
+          const y=bankTop + r*(rowH+14);
+          d.w=bw; d.h=rowH;
+          d.homeX=x; d.homeY=y;
+          if(!d.homeSet){
+            d.x=x; d.y=y; d.homeSet=true;
+          } else if(ui.drag && ui.drag.id===d.id){
+            // Track pointer while being dragged
+            d.x = ui.pointer.x - ui.drag.offx;
+            d.y = ui.pointer.y - ui.drag.offy;
+          } else {
+            d.x = lerp(d.x, d.homeX, 0.22);
+            d.y = lerp(d.y, d.homeY, 0.22);
+          }
+        }
+      },
+      pickDrag(px,py){
+        for(let i=this.draggables.length-1;i>=0;i--){
+          const d=this.draggables[i];
+          if(px>=d.x && px<=d.x+d.w && py>=d.y && py<=d.y+d.h) return d;
+        }
+        return null;
+      },
+      drop(d){
+        for(const s of this.slots){
+          if(s.kind!==d.kind) continue;
+          if(hitRect(s, ui.pointer.x, ui.pointer.y)){
+            if(s.holds && s.holds!==d.id){
+              const other=this.draggables.find(x=>x.id===s.holds);
+              if(other){ other.placed=null; other.homeSet=true; }
+            }
+            s.holds=d.id;
+            d.placed=s.id;
+            d.x=s.x; d.y=s.y; d.w=s.w; d.h=s.h;
+            this.check();
+            return;
+          }
+        }
+        d.placed=null;
+        d.homeSet=true;
+        // ensure no slot still references this draggable
+        for(const s of this.slots){ if(s.holds===d.id) s.holds=null; }
+        if(this.set){ this.set.done=false; this.set.perfect=false; }
+      },
+      returnAll(){
+        if(!this.set || this.set.error) return;
+        for(const s of this.slots) s.holds=null;
+        for(const d of this.draggables){ d.placed=null; d.homeSet=true; }
+        this.set.done=false; this.set.perfect=false;
+        toast('Returned all labels.', 'info', 1400);
+      },
+      check(){
+        if(!this.set || this.set.error) return;
+        let all=true;
+        let perfect=true;
+        for(const s of this.slots){
+          if(!s.holds){ all=false; continue; }
+          const d=this.draggables.find(x=>x.id===s.holds);
+          if(!d){ all=false; continue; }
+          if(d.text!==s.expectsText) perfect=false;
+        }
+        if(all){
+          this.set.done=true;
+          this.set.perfect=perfect;
+          const d=bumpDay();
+          state.day[d].match++;
+          state.lifetime.match.sets++;
+          if(perfect) state.lifetime.match.perfect++;
+          
+          // Streak scoring (Sorting Table)
+          if(!state.score) state.score={quiz:0, quizBest:0, match:0, matchBest:0};
+          if(perfect){
+            state.score.match = (state.score.match||0) + 10;
+            state.score.matchBest = Math.max(state.score.matchBest||0, state.score.match);
+          } else {
+            state.score.match = 0;
+          }
+          saveState();
+          toast(perfect?'Perfect match!':'Placed all — check a couple mismatches.', perfect?'ok':'info',2200);
+        }
+      }
+    };
+
+    // ---------- Sidebar geometry helper ----------
+    function sidebarWidth(forScene){
+      const s = forScene || scene;
+      if(s==='snake') return clamp(220 + W*0.03, 200, 280);
+      return clamp(320 + W*0.06, 320, 440);
+    }
+    function gameAreaRect(pad, forScene){
+      const s = forScene || scene;
+      const sw = (s==='invaders' || s==='snake' || s==='night') ? sidebarWidth(s) : 0;
+      const gx = pad;
+      const gy = pad+150;
+      const gw = W - pad*2 - sw - (sw?12:0);
+      // Snake needs bottom space for the D-pad (3×42 + 2×6 gaps + 14 margin + pad)
+      const bottomReserve = (s==='snake') ? 168 : 0;
+      const gh = H - gy - pad - bottomReserve;
+      return {x:gx, y:gy, w:gw, h:gh, sw, sx: gx+gw+12, sy: gy};
+    }
+
+    // ---------- Invaders ----------
+const invaders = {
+  ship:{x:0,y:0,w:58,h:24,vx:0},
+  bullets:[],
+  ebullets:[],
+  enemies:[],
+  score:0,
+  lives:3,
+  level:1,
+
+  stepDir:1,
+  groupX:0,
+  groupY:0,
+  groupVX:54,
+  stepDown:18,
+
+  shootTimer:0,
+  fireCD:0,
+
+  diveTimer:0,
+  ufoTimer:0,
+  ufo:null,
+
+  lastHit:null,
+  stats:{shots:0,hits:0},
+
+  grid:null,
+
+  finalize(){
+    if(this.score > state.lifetime.invaders.best) state.lifetime.invaders.best=this.score;
+    saveState();
+  },
+  endGame(msg){
+    this.lives=0;
+    toast(msg, 'warn', 2200);
+    this.finalize();
+  },
+
+  reset(full=false){
+    this.bullets=[]; this.ebullets=[]; this.enemies=[];
+    this.score=0; this.lives=3; this.level=1;
+    this.groupX=0; this.groupY=0; this.stepDir=1;
+    this.groupVX=54;
+    this.stepDown=18;
+    this.shootTimer=0;
+    this.fireCD=0;
+    this.diveTimer=2.4;
+    this.ufoTimer=8 + Math.random()*8;
+    this.ufo=null;
+    this.lastHit=null;
+    this.stats={shots:0,hits:0};
+
+    this.spawnWave();
+
+    const d=bumpDay();
+    state.day[d].invaders++;
+    state.lifetime.invaders.runs++;
+    saveState();
+  },
+
+  toggleLabelMode(){
+    state.settings.invaderLabel = (state.settings.invaderLabel==='family') ? 'scientific' : 'family';
+    saveState();
+    toast('Invaders label: '+(state.settings.invaderLabel==='family'?'Family':'Scientific'), 'info', 1100);
+  },
+
+  makeEnemyFromRow(idx){
+    const row=data.rows[idx];
+    const url=getCol(row,'image_url').trim();
+    const sci=getCol(row,'scientific_name').trim();
+    const fam=getCol(row,'taxon_family_name').trim() || '(no family)';
+    const common=getCommonName(row);
+    const recordUrl=getRecordUrl(row);
+    return {
+      idx,url,sci,fam,common,recordUrl,
+      alive:true,
+      img:loadImage(url),
+
+      detached:false,
+      x:0,y:0,
+      vx:0,vy:0,
+      diveFire:0
+    };
+  },
+
+  pickRowAny(){
+    const pool = data.idx.any.length ? data.idx.any : data.idx.sci;
+    return pickValidRow(pool, 7000, true);
+  },
+
+  spawnWave(){
+    this.enemies.length=0;
+
+    const cols=11, rows=5;
+    const total=cols*rows;
+    const used=new Set();
+
+    for(let i=0;i<total;i++){
+      let idx=this.pickRowAny();
+      if(idx==null) continue;
+      let guard=0;
+      while(used.has(idx) && guard++<50){
+        idx=this.pickRowAny();
+        if(idx==null) break;
+      }
+      if(idx==null) continue;
+      used.add(idx);
+      this.enemies.push(this.makeEnemyFromRow(idx));
+    }
+
+    const pad=18;
+    const ar=gameAreaRect(pad);
+    const cell= Math.min(64, Math.max(44, ar.w/(cols+1)));
+    this.grid={cols, rows, cell, size: Math.min(54, cell*0.82)};
+    this.groupX = ar.x + 12;
+    this.groupY = ar.y + 12;
+
+    this.groupVX = 50 + this.level*12;
+    this.stepDown = 16 + this.level*2;
+    this.stepDir = 1;
+    this.shootTimer = 0;
+    this.fireCD = 0;
+
+    this.diveTimer = Math.max(1.8, 4.4 - this.level*0.25) + Math.random()*2.2;
+    this.ufoTimer  = Math.max(7.5, 16 - this.level*0.7) + Math.random()*8;
+    this.ufo=null;
+  },
+
+  fire(){
+    if(paused) return;
+    if(this.lives<=0) return;
+    if(this.fireCD>0) return;
+    this.fireCD=0.16;
+
+    const x=this.ship.x + this.ship.w/2;
+    const y=this.ship.y - 10;
+    this.bullets.push({x,y,vy:-780,alive:true});
+    this.stats.shots++;
+  },
+
+  enemyBounds(){
+    const {cols, cell, size}=this.grid;
+    let minC=1e9, maxC=-1e9, minR=1e9, maxR=-1e9;
+    for(let i=0;i<this.enemies.length;i++){
+      const e=this.enemies[i];
+      if(!e || !e.alive || e.detached) continue;
+      const c=i%cols, r=Math.floor(i/cols);
+      minC=Math.min(minC,c); maxC=Math.max(maxC,c);
+      minR=Math.min(minR,r); maxR=Math.max(maxR,r);
+    }
+    if(maxC<0) return {minX:0,maxX:0,minY:0,maxY:0, empty:true};
+    const minX = this.groupX + minC*cell;
+    const maxX = this.groupX + maxC*cell + size;
+    const minY = this.groupY + minR*cell;
+    const maxY = this.groupY + maxR*cell + size;
+    return {minX,maxX,minY,maxY, empty:false};
+  },
+
+  enemyCenter(i,e){
+    const {cols, cell, size}=this.grid;
+    if(e.detached) return {cx:e.x, cy:e.y, r:size*0.46};
+    const c=i%cols, r=Math.floor(i/cols);
+    const ex = this.groupX + c*cell;
+    const ey = this.groupY + r*cell;
+    return {cx:ex+size/2, cy:ey+size/2, r:size*0.46};
+  },
+
+  pickDiverIndex(){
+    const cand=[];
+    for(let i=0;i<this.enemies.length;i++){
+      const e=this.enemies[i];
+      if(!e || !e.alive || e.detached) continue;
+      cand.push(i);
+    }
+    if(!cand.length) return null;
+    return choose(cand);
+  },
+
+  startDive(count=1){
+    for(let k=0;k<count;k++){
+      const i=this.pickDiverIndex();
+      if(i==null) return;
+      const e=this.enemies[i];
+      const p=this.enemyCenter(i,e);
+      e.detached=true;
+      e.x=p.cx; e.y=p.cy;
+      e.vx=(Math.random()<0.5?-1:1)*(40+Math.random()*70);
+      e.vy=140 + this.level*20;
+      e.diveFire=0.45 + Math.random()*0.9;
+    }
+  },
+
+  spawnUFO(ar){
+    if(this.ufo) return;
+    const idx=this.pickRowAny();
+    if(idx==null) return;
+    const e=this.makeEnemyFromRow(idx);
+    const fromLeft = Math.random()<0.5;
+    const y = ar.y + 32;
+    const x = fromLeft ? (ar.x - 70) : (ar.x + ar.w + 70);
+    const vx = (fromLeft ? 1 : -1) * (190 + this.level*12);
+    this.ufo={x,y,vx,e,alive:true};
+  },
+
+  update(dt){
+    const pad=18;
+    const ar=gameAreaRect(pad);
+
+    // Ship controls
+    const speed=540;
+    let dir=0;
+    if(keysDown.has('ArrowLeft')) dir -= 1;
+    if(keysDown.has('ArrowRight')) dir += 1;
+    this.ship.vx = lerp(this.ship.vx, dir*speed, 0.22);
+    this.ship.x += this.ship.vx*dt;
+    this.ship.x = clamp(this.ship.x, ar.x+8, ar.x+ar.w-8-this.ship.w);
+
+    // Timers
+    this.fireCD = Math.max(0, this.fireCD - dt);
+
+    // March (formation only)
+    const aliveTotal=this.enemies.filter(e=>e && e.alive).length;
+    const speedBoost = 1 + (1 - aliveTotal/Math.max(1,this.enemies.length)) * 3.2;
+    this.groupX += this.stepDir * this.groupVX * speedBoost * dt;
+
+    const b=this.enemyBounds();
+    if(!b.empty){
+      if(b.maxX > ar.x+ar.w-10){
+        this.stepDir=-1;
+        this.groupX -= 10;
+        this.groupY += this.stepDown;
+      } else if(b.minX < ar.x+10){
+        this.stepDir=1;
+        this.groupX += 10;
+        this.groupY += this.stepDown;
+      }
+      if(b.maxY >= this.ship.y - 12){
+        this.endGame('Overrun at the sheet edge.');
+      }
+    }
+
+    const shipCx = this.ship.x+this.ship.w/2;
+    const shipCy = this.ship.y+this.ship.h/2;
+
+    // Dive attacks
+    this.diveTimer -= dt;
+    const diveInterval = Math.max(1.8, 6.2 - this.level*0.35);
+    if(this.diveTimer<=0 && this.lives>0){
+      const n = (this.level>=4 && Math.random()<0.25) ? 2 : 1;
+      this.startDive(n);
+      this.diveTimer = diveInterval * (0.55 + Math.random()*0.75);
+    }
+
+    // Update detached enemies
+    for(const e of this.enemies){
+      if(!e || !e.alive || !e.detached) continue;
+
+      const ax = clamp((shipCx - e.x) * 1.8, -520, 520);
+      e.vx = lerp(e.vx, ax, 0.06);
+      e.vy = lerp(e.vy, 260 + this.level*32, 0.05);
+
+      e.x += e.vx*dt;
+      e.y += e.vy*dt;
+
+      e.diveFire -= dt;
+      if(e.diveFire<=0 && this.lives>0){
+        e.diveFire = 0.55 + Math.random()*0.8;
+        const dx = shipCx - e.x;
+        const vx = clamp(dx*1.2, -220, 220);
+        this.ebullets.push({x:e.x, y:e.y+12, vx, vy:520+this.level*28, alive:true});
+      }
+
+      // impact
+      if(Math.hypot(e.x-shipCx, e.y-shipCy) < 24){
+        e.alive=false;
+        this.lives--;
+        toast('Dive impact!', 'warn', 900);
+        if(this.lives<=0) this.finalize();
+      } else if(e.y > ar.y+ar.h+60){
+        e.alive=false;
+        this.lives--;
+        toast('A specimen breached the sheet!', 'warn', 1200);
+        if(this.lives<=0) this.finalize();
+      }
+    }
+
+    if(this.lives<=0) return;
+
+    // Player bullets
+    for(const p of this.bullets){
+      if(!p.alive) continue;
+      p.y += p.vy*dt;
+      if(p.y < ar.y-40) p.alive=false;
+    }
+
+    // Enemy fire (formation)
+    this.shootTimer -= dt;
+    const baseInterval = Math.max(0.18, 0.95 - this.level*0.11);
+    if(this.shootTimer <= 0){
+      this.shootTimer = baseInterval * (0.55 + Math.random()*0.75);
+      const {cols, cell, size}=this.grid;
+      const col = rnd(cols);
+      let shooterIdx=null;
+      for(let r=this.grid.rows-1;r>=0;r--){
+        const i = r*cols + col;
+        const e=this.enemies[i];
+        if(e && e.alive && !e.detached){ shooterIdx=i; break; }
+      }
+      if(shooterIdx!=null){
+        const c=shooterIdx%cols, r=Math.floor(shooterIdx/cols);
+        const sx = this.groupX + c*cell + size/2;
+        const sy = this.groupY + r*cell + size + 4;
+        this.ebullets.push({x:sx,y:sy,vx:0,vy:460+this.level*34,alive:true});
+      }
+    }
+
+    // UFO bonus
+    this.ufoTimer -= dt;
+    if(this.ufoTimer<=0){
+      this.spawnUFO(ar);
+      this.ufoTimer = Math.max(8, 18 - this.level*0.75) + Math.random()*10;
+    }
+    if(this.ufo && this.ufo.alive){
+      this.ufo.x += this.ufo.vx*dt;
+      if(this.ufo.x < ar.x-140 || this.ufo.x > ar.x+ar.w+140) this.ufo=null;
+    }
+
+    // Enemy bullets
+    for(const b0 of this.ebullets){
+      if(!b0.alive) continue;
+      b0.x += (b0.vx||0)*dt;
+      b0.y += b0.vy*dt;
+      if(b0.y > ar.y+ar.h+40) b0.alive=false;
+      const cx = shipCx, cy = shipCy;
+      if(Math.hypot(b0.x-cx, b0.y-cy) < 22){
+        b0.alive=false;
+        this.lives--;
+        toast('Hit!', 'warn', 850);
+        if(this.lives<=0){ this.finalize(); }
+      }
+    }
+
+    // Collisions
+    const {size}=this.grid;
+    for(const p of this.bullets){
+      if(!p.alive) continue;
+
+      // UFO
+      if(this.ufo && this.ufo.alive){
+        const u=this.ufo;
+        if(Math.hypot(p.x-u.x, p.y-u.y) < size*0.55){
+          p.alive=false;
+          this.score += 60;
+          this.lastHit = u.e;
+          this.stats.hits++;
+          toast('Bonus specimen! +60', 'ok', 900);
+          this.ufo=null;
+          continue;
+        }
+      }
+
+      for(let i=0;i<this.enemies.length;i++){
+        const e=this.enemies[i];
+        if(!e || !e.alive) continue;
+        const pos=this.enemyCenter(i,e);
+        if(Math.hypot(p.x-pos.cx, p.y-pos.cy) < pos.r){
+          p.alive=false;
+          e.alive=false;
+          this.score += e.detached ? 18 : 10;
+          this.lastHit = e;
+          this.stats.hits++;
+          break;
+        }
+      }
+    }
+
+    // Clean
+    this.bullets=this.bullets.filter(b=>b.alive);
+    this.ebullets=this.ebullets.filter(b=>b.alive);
+
+    const anyAlive = this.enemies.some(e=>e && e.alive);
+    if(!anyAlive && this.lives>0){
+      this.level++;
+      this.score += 80;
+      toast('Wave cleared! +80', 'ok', 1200);
+      this.spawnWave();
+    }
+
+    if(this.lives<=0){
+      this.finalize();
+    }
+  }
+};
+
+    // ---------- Snake ----------
+    const snake = {
+      cell:24,
+      cols:0, rows:0,
+      dir:{x:1,y:0}, nextDir:{x:1,y:0},
+      t:0, step:0.13,
+      body:[],
+      alive:true,
+      score:0,
+      voiceOn:true,
+      lastEat:null,
+      flashSpec:null,
+      flashUntil:0,
+      forbidden:{family:'', rep:null},
+      food:null,
+      reset(full=false){
+        const d=bumpDay();
+        state.day[d].snake++;
+        state.lifetime.snake.runs++;
+        saveState();
+        this.voiceOn = (state.settings.snakeVoice!==false);
+
+        this.alive=true;
+        this.score=0;
+        this.lastEat=null;
+        this.flashSpec=null;
+        this.flashUntil=0;
+        this.forbidden.family=''; this.forbidden.rep=null;
+        this.layout();
+        this.body=[{x:Math.floor(this.cols*0.35),y:Math.floor(this.rows*0.5)},
+                   {x:Math.floor(this.cols*0.35)-1,y:Math.floor(this.rows*0.5)},
+                   {x:Math.floor(this.cols*0.35)-2,y:Math.floor(this.rows*0.5)}];
+        this.dir={x:1,y:0};
+        this.nextDir={x:1,y:0};
+        this.t=0;
+        this.step=0.14;
+        this.spawnFood();
+      },
+      layout(){
+        const pad=Math.max(18, Math.min(44, W*0.05));
+        const ar=gameAreaRect(pad, 'snake');
+        const target=clamp(Math.min(ar.w, ar.h)/26, 18, 28);
+        this.cell=Math.floor(target);
+        this.cols=Math.floor(ar.w/this.cell);
+        this.rows=Math.floor(ar.h/this.cell);
+        this.cols=Math.max(14,this.cols);
+        this.rows=Math.max(14,this.rows);
+        if(this.food && (this.food.x>=this.cols || this.food.y>=this.rows)) this.spawnFood();
+      },
+      pickRowAny(){
+        const pool=data.idx.any.length?data.idx.any:data.idx.sci;
+        return pickValidRow(pool, 6000, true);
+      },
+      pickForbidden(force=false){
+        if(!data.uniques.fam.length){ this.forbidden.family=''; this.forbidden.rep=null; return; }
+        const fam=choose(data.uniques.fam)||'';
+        this.forbidden.family=fam;
+
+        let rep=null;
+        let tries=0;
+        while(!rep && tries++<7000){
+          const idx=data.idx.fam.length?data.idx.fam[rnd(data.idx.fam.length)]:null;
+          if(idx==null) break;
+          const row=data.rows[idx];
+          const rf=getCol(row,'taxon_family_name').trim();
+          if(!rf || safeLower(rf)!==safeLower(fam)) continue;
+          const url=getCol(row,'image_url').trim();
+          const sci=getCol(row,'scientific_name').trim();
+          const common=getCommonName(row);
+          const recordUrl=getRecordUrl(row);
+          if(!url || !sci || data.badImage.has(url)) continue;
+          rep={idx,url,sci,common,fam:rf,recordUrl,img:loadImage(url)};
+        }
+        this.forbidden.rep=rep;
+      },
+      spawnFood(){
+        const idx=this.pickRowAny();
+        if(idx==null) return;
+        const row=data.rows[idx];
+        const url=getCol(row,'image_url').trim();
+        const sci=getCol(row,'scientific_name').trim();
+        const fam=getCol(row,'taxon_family_name').trim() || '(no family)';
+        const common=getCommonName(row);
+        const recordUrl=getRecordUrl(row);
+
+        // Keep food away from edges because it's now larger
+        const edge=1;
+        let tries=0;
+        let fx=edge, fy=edge;
+        const occupied=new Set(this.body.map(p=>p.x+','+p.y));
+        while(tries++<4000){
+          fx=edge + rnd(Math.max(1,this.cols-edge*2));
+          fy=edge + rnd(Math.max(1,this.rows-edge*2));
+          if(occupied.has(fx+','+fy)) continue;
+          break;
+        }
+        const isForbidden = (safeLower(fam)===safeLower(this.forbidden.family));
+        this.food={x:fx,y:fy, idx,url,sci,fam,common,recordUrl, img:loadImage(url), isForbidden};
+      },
+      setDir(dx,dy){
+        if(dx===-this.dir.x && dy===-this.dir.y) return;
+        this.nextDir={x:dx,y:dy};
+      },
+      update(dt){
+        if(!this.alive) return;
+        if(keysDown.has('ArrowUp')) this.setDir(0,-1);
+        else if(keysDown.has('ArrowDown')) this.setDir(0,1);
+        else if(keysDown.has('ArrowLeft')) this.setDir(-1,0);
+        else if(keysDown.has('ArrowRight')) this.setDir(1,0);
+
+        this.t += dt;
+        while(this.t >= this.step){
+          this.t -= this.step;
+          this.dir = this.nextDir;
+
+          const head=this.body[0];
+          let nx=head.x+this.dir.x;
+          let ny=head.y+this.dir.y;
+
+          if(nx<0||ny<0||nx>=this.cols||ny>=this.rows){
+            this.alive=false;
+            toast('Bonk.', 'warn', 1300);
+            if(this.score>state.lifetime.snake.best){ state.lifetime.snake.best=this.score; saveState(); }
+            return;
+          }
+
+          for(const p of this.body){
+            if(p.x===nx && p.y===ny){
+              this.alive=false;
+              toast('Tangled.', 'warn', 1300);
+              if(this.score>state.lifetime.snake.best){ state.lifetime.snake.best=this.score; saveState(); }
+              return;
+            }
+          }
+
+          this.body.unshift({x:nx,y:ny});
+
+          if(this.food && nx===this.food.x && ny===this.food.y){
+            const eaten=this.food;
+            this.lastEat=eaten;
+            this.flashSpec=eaten;
+            this.flashUntil=performance.now()+1200;
+
+            if(eaten.isForbidden){
+              toast('That was the forbidden family!', 'warn', 1600);
+              this.score=Math.max(0, this.score-15);
+              this.body.pop(); if(this.body.length>3) this.body.pop();
+            } else {
+              this.score += 10;
+              this.step = Math.max(0.07, this.step*0.985);
+            }
+
+            if(this.voiceOn && eaten && eaten.sci) tts.speak(eaten.sci);
+            this.spawnFood();
+          } else {
+            this.body.pop();
+          }
+        }
+      }
+    };
+
+    // ---------- Night Walk ----------
+    const night = {
+      dateIndex:0,
+      familyFilter:'All',
+      datePicker:false,
+      familyPicker:false,
+      dateScroll:0,
+      familyScroll:0,
+      session:[],    // row indices
+      sprites:[],    // arrivals on sheet
+      selected:null, // sprite
+      modalIdx:null,       // index in sprites[] for sidebar navigation
+      seenFamilies:[],     // [{fam, count, color}] built as sprites settle
+      _famLegendScrollRow: 0,
+      familyColorPalette:['#b14c9b','#46c2d2','#f7941d','#00a561','#f95caf','#7bb3ff','#ffcc44','#a8e06d'],
+      t:0,
+      spawnEvery:0.42,
+      nextSpawn:0,
+      autoplay:true,
+      reset(full=false){
+        this.dateIndex=0;
+        this.session=[];
+        this.sprites=[];
+        this.selected=null;
+        this.modalIdx=null;
+        this.seenFamilies=[];
+        this._famLegendScrollRow=0;
+        this.t=0;
+        this.nextSpawn=0;
+        this.autoplay = (state.settings.nightAuto!==false);
+        if(state.csv.loaded){
+          buildNightIndex();
+          if(data.nightDates.length){
+            this.dateIndex=0;
+            this.loadDate(data.nightDates[this.dateIndex]);
+          }
+        }
+      },
+      currentDate(){
+        if(!data.nightDates.length) return '';
+        return data.nightDates[clamp(this.dateIndex,0,data.nightDates.length-1)];
+      },
+      toggleDatePicker(){
+        this.datePicker = !this.datePicker;
+        if(this.datePicker){
+          this.familyPicker = false;
+          this._dateScrollPx = Math.max(0, this.dateIndex * 42 - 160);
+        }
+      },
+      toggleFamilyPicker(){
+        this.familyPicker = !this.familyPicker;
+        if(this.familyPicker){
+          this.datePicker = false;
+          this._famScrollPx = 0;
+        }
+      },
+      setDateIndex(i){
+        if(!data.nightDates.length) return;
+        this.dateIndex = clamp(i, 0, data.nightDates.length-1);
+        this.datePicker = false;
+        this.loadDate(this.currentDate());
+      },
+      setFamilyFilter(f){
+        this.familyFilter = f || 'All';
+        this.familyPicker = false;
+        this.loadDate(this.currentDate());
+      },
+      familiesForDate(dateStr){
+        const fk = data.keys.family;
+        if(!fk || !data.nightMap || !data.nightMap[dateStr]) return [];
+        const set=new Set();
+        for(const idx of data.nightMap[dateStr]){
+          const row=data.rows[idx];
+          const url=getCol(row,'image_url').trim();
+          const sci=getCol(row,'scientific_name').trim();
+          if(!url || !sci || data.badImage.has(url)) continue;
+          const fam=getCol(row,fk).trim();
+          if(fam) set.add(fam);
+        }
+        return Array.from(set).sort((a,b)=>a.localeCompare(b));
+      },
+      toggleAuto(){
+        this.autoplay=!this.autoplay;
+        state.settings.nightAuto=this.autoplay;
+        saveState();
+        toast(this.autoplay?'Auto: on':'Auto: off','info',900);
+      },
+      loadDate(dateStr){
+        this.sprites=[];
+        this.selected=null;
+        this.modalIdx=null;
+        this.seenFamilies=[];
+        this._famLegendScrollRow=0;
+        this.t=0;
+        this.nextSpawn=0;
+
+        if(!data.nightMap || !data.nightMap[dateStr]){
+          this.session=[];
+          return;
+        }
+        // Build session list, sorted by time if possible
+        const list = data.nightMap[dateStr].slice();
+        const tk=data.keys.time;
+        if(tk){
+          list.sort((a,b)=>{
+            const ta=parseTimeVal(getCol(data.rows[a], tk));
+            const tb=parseTimeVal(getCol(data.rows[b], tk));
+            const na=Number.isNaN(ta), nb=Number.isNaN(tb);
+            if(na && nb) return a-b;
+            if(na) return 1;
+            if(nb) return -1;
+            return ta-tb;
+          });
+        }
+        // filter only rows with image_url and sci
+        this.session = list.filter(idx=>{
+          const row=data.rows[idx];
+          const url=getCol(row,'image_url').trim();
+          const sci=getCol(row,'scientific_name').trim();
+          if(!(url && sci) || data.badImage.has(url)) return false;
+          const ff = this.familyFilter;
+          const fk = data.keys.family;
+          if(ff && ff!=='All' && fk){
+            const fam=getCol(row,fk).trim();
+            if(fam!==ff) return false;
+          }
+          return true;
+        });
+      },
+      prevDate(){
+        if(!data.nightDates.length) return;
+        this.dateIndex = (this.dateIndex+1) % data.nightDates.length;
+        this.loadDate(this.currentDate());
+        toast(this.currentDate(),'info',800);
+      },
+      nextDate(){
+        if(!data.nightDates.length) return;
+        this.dateIndex = (this.dateIndex-1 + data.nightDates.length) % data.nightDates.length;
+        this.loadDate(this.currentDate());
+        toast(this.currentDate(),'info',800);
+      },
+      spawnOne(sheet){
+        const nextIdx = this.sprites.length;
+        if(nextIdx >= this.session.length) return;
+
+        const ridx=this.session[nextIdx];
+        const row=data.rows[ridx];
+        const url=getCol(row,'image_url').trim();
+        const sci=getCol(row,'scientific_name').trim();
+        const fam=getCol(row,'taxon_family_name').trim() || '(no family)';
+        const common=getCommonName(row);
+        const recordUrl=getRecordUrl(row);
+
+        // target position on sheet
+        const pad=20;
+        const tx = sheet.x + pad + Math.random()*(sheet.w - pad*2);
+        const ty = sheet.y + pad + Math.random()*(sheet.h - pad*2);
+
+        const s = 0.86 + Math.random()*0.30;
+        const startX = sheet.x + sheet.w*(0.15 + Math.random()*0.70);
+        const startY = sheet.y - 80 - Math.random()*120;
+
+        this.sprites.push({
+          idx:ridx, url, sci, fam, common, recordUrl,
+          img:loadImage(url),
+          // flight path (quadratic bezier): start -> control -> target
+          x:startX, y:startY,
+          sx:startX, sy:startY,
+          cx: ((startX+tx)/2) + (Math.random()*2-1)*120*s,
+          cy: ((startY+ty)/2) - (120 + Math.random()*160),
+          tx, ty, s,
+          p:0,
+          dur: 0.85 + Math.random()*0.80,
+          a:0, settled:false, wiggle:Math.random()*Math.PI*2
+        });
+      },
+      update(dt, sheet){
+        this.t += dt;
+        // auto spawns
+        if(this.autoplay && !paused){
+          this.nextSpawn -= dt;
+          while(this.nextSpawn <= 0){
+            if(this.sprites.length >= this.session.length) break;
+            this.spawnOne(sheet);
+            this.nextSpawn += this.spawnEvery;
+          }
+        }
+        // animate sprites
+        for(const sp of this.sprites){
+          sp.wiggle += dt*(1.5 + sp.s);
+          const wob = Math.sin(sp.wiggle)*0.8;
+          sp.a = clamp(sp.a + dt*1.6, 0, 1);
+          if(!sp.settled){
+            // Fly in on a curved arc, then settle with a gentle flutter.
+            sp.p = clamp((sp.p||0) + dt/Math.max(0.25, (sp.dur||1)), 0, 1);
+            const t = sp.p;
+            const e = 1 - Math.pow(1-t, 3); // easeOutCubic
+            const om = 1 - e;
+
+            // quadratic bezier position
+            const bx = (om*om)*sp.sx + 2*om*e*sp.cx + (e*e)*sp.tx;
+            const by = (om*om)*sp.sy + 2*om*e*sp.cy + (e*e)*sp.ty;
+
+            // flutter fades as it lands
+            const flutter = wob * (1.1 - 0.9*e);
+            sp.x = bx + Math.sin(sp.wiggle*1.7)*1.8*(1-e);
+            sp.y = by + flutter;
+
+            if(sp.p >= 1){
+              sp.settled=true;
+              sp.x = sp.tx;
+              sp.y = sp.ty + wob*0.35;
+              if(!sp._famNoted){ sp._famNoted=true; this.noteFamily(sp); }
+            }
+          } else {
+            sp.x = lerp(sp.x, sp.tx, 0.14);
+            sp.y = lerp(sp.y, sp.ty + wob, 0.14);
+          }
+        }
+      },
+      hitTest(px,py){
+        // search topmost first
+        for(let i=this.sprites.length-1;i>=0;i--){
+          const sp=this.sprites[i];
+          const r = 34*sp.s;
+          if(Math.hypot(px-sp.x, py-sp.y) <= r) return sp;
+        }
+        return null;
+      },
+      swarm(){
+        this.selected=null; this.modalIdx=null;
+        const _p=Math.max(18, Math.min(44, W*0.05));
+        const _ar=gameAreaRect(_p);
+        const _sh={x:_ar.x+22, y:_ar.y+22, w:_ar.w-44, h:_ar.h-44};
+        const _spad=24, _r0=34;
+        // assign fresh random target positions
+        for(const sp of this.sprites){
+          if(!sp.settled) continue;
+          sp.tx=_sh.x+_spad+Math.random()*(_sh.w-_spad*2);
+          sp.ty=_sh.y+_spad+Math.random()*(_sh.h-_spad*2);
+        }
+        // repulsion passes to separate targets
+        for(let _iter=0; _iter<80; _iter++){
+          for(let i=0; i<this.sprites.length; i++){
+            const a=this.sprites[i]; if(!a.settled) continue;
+            const ra=_r0*a.s*1.15;
+            for(let j=i+1; j<this.sprites.length; j++){
+              const b=this.sprites[j]; if(!b.settled) continue;
+              const rb=_r0*b.s*1.15;
+              const minD=ra+rb;
+              const dx=b.tx-a.tx, dy=b.ty-a.ty;
+              const dist=Math.max(0.5, Math.hypot(dx,dy));
+              if(dist<minD){
+                const push=(minD-dist)*0.5;
+                const nx=dx/dist, ny=dy/dist;
+                a.tx-=nx*push*0.5; a.ty-=ny*push*0.5;
+                b.tx+=nx*push*0.5; b.ty+=ny*push*0.5;
+              }
+            }
+            a.tx=clamp(a.tx, _sh.x+_spad, _sh.x+_sh.w-_spad);
+            a.ty=clamp(a.ty, _sh.y+_spad, _sh.y+_sh.h-_spad);
+          }
+        }
+        // un-settle each sprite and give it a new bezier arc to fly to its target
+        for(const sp of this.sprites){
+          if(!sp.settled) continue;
+          sp.sx=sp.x; sp.sy=sp.y;
+          sp.cx=((sp.sx+sp.tx)/2)+(Math.random()*2-1)*100*sp.s;
+          sp.cy=((sp.sy+sp.ty)/2)-(70+Math.random()*90);
+          sp.p=0;
+          sp.dur=0.55+Math.random()*0.45;
+          sp.settled=false;
+        }
+      },
+      sessionStats(){
+        const sciSet=new Set();
+        const famSet=new Set();
+        for(const idx of this.session){
+          const row=data.rows[idx];
+          const sci=getCol(row,'scientific_name').trim();
+          const fam=getCol(row,'taxon_family_name').trim();
+          if(sci) sciSet.add(sci);
+          if(fam) famSet.add(fam);
+        }
+        return {records:this.session.length, species:sciSet.size, families:famSet.size};
+      },
+      noteFamily(sp){
+        const fam=sp.fam||'(no family)';
+        const ex=this.seenFamilies.find(f=>f.fam===fam);
+        if(ex){ ex.count++; }
+        else {
+          const color=this.familyColorPalette[this.seenFamilies.length % this.familyColorPalette.length];
+          this.seenFamilies.push({fam,count:1,color});
+        }
+      },
+      getFamilyColor(fam){
+        const sf=this.seenFamilies.find(f=>f.fam===fam);
+        return sf ? sf.color : this.familyColorPalette[0];
+      },
+      openModal(sp){
+        const i=this.sprites.indexOf(sp);
+        if(i>=0) this.modalIdx=i;
+      },
+      closeModal(){ this.selected=null; this.modalIdx=null; },
+      modalNext(){
+        if(!this.sprites.length) return;
+        const cur=this.modalIdx??0;
+        this.modalIdx=(cur+1)%this.sprites.length;
+        this.selected=this.sprites[this.modalIdx];
+      },
+      modalPrev(){
+        if(!this.sprites.length) return;
+        const cur=this.modalIdx??0;
+        this.modalIdx=(cur-1+this.sprites.length)%this.sprites.length;
+        this.selected=this.sprites[this.modalIdx];
+      },
+      formatObservedTime(sp){
+        const tk=data.keys.time;
+        if(!tk || sp.idx==null) return '';
+        const raw=getCol(data.rows[sp.idx],tk);
+        const t=parseTimeVal(raw);
+        if(Number.isNaN(t)) return '';
+        const d=new Date(t);
+        let h=d.getHours(), m=d.getMinutes();
+        const ampm=h>=12?'PM':'AM';
+        h=h%12; if(h===0) h=12;
+        return h+':'+String(m).padStart(2,'0')+' '+ampm;
+      }
+    };
+
+    // ---------- Layout init ----------
+    function relayout(){
+      setCanvasSize();
+      initSky();
+      const pad=Math.max(18, Math.min(44, W*0.05));
+      const ar=gameAreaRect(pad);
+      invaders.ship.w=62; invaders.ship.h=26;
+      invaders.ship.x = ar.x + ar.w/2 - invaders.ship.w/2;
+      invaders.ship.y = ar.y + ar.h - 46;
+
+      snake.layout();
+    }
+    window.addEventListener('resize', relayout);
+    relayout();
+
+    // ---------- Pointer-based drag/drop handlers ----------
+    function pointerDown(){
+      // Matching drag
+      if(scene==='match' && match.set && !match.set.error && !paused){
+        const d = match.pickDrag(ui.pointer.x, ui.pointer.y);
+        if(d){
+          // If a label is already placed in a slot, allow picking it back up.
+          if(d.placed){
+            const s = match.slots.find(x=>x.id===d.placed);
+            if(s && s.holds===d.id) s.holds=null;
+            d.placed=null;
+            if(match.set){ match.set.done=false; match.set.perfect=false; }
+          }
+          ui.drag={type:'match', id:d.id, offx:ui.pointer.x - d.x, offy:ui.pointer.y - d.y};
+          const idx = match.draggables.findIndex(x=>x.id===d.id);
+          if(idx>=0){ const [it]=match.draggables.splice(idx,1); match.draggables.push(it); }
+          return;
+        }
+      }
+
+      // Night selection
+      if(scene==='night'){
+        const sp = night.hitTest(ui.pointer.x, ui.pointer.y);
+        if(sp){
+          night.selected=sp;
+          night.openModal(sp);
+          return;
+        }
+      }
+
+      // Snake on-screen D-pad
+      if(scene==='snake'){
+        const pad=Math.max(18, Math.min(44, W*0.05));
+        const ar=gameAreaRect(pad);
+        const dpadS=42, dpadG=6;
+        const dpadW=dpadS*3+dpadG*2;
+        const bx=ar.x+(ar.w-dpadW)/2;
+        const by=ar.y+ar.h+14;
+        const up={x:bx+dpadS+dpadG, y:by, w:dpadS, h:dpadS};
+        const left={x:bx, y:by+dpadS+dpadG, w:dpadS, h:dpadS};
+        const right={x:bx+(dpadS+dpadG)*2, y:by+dpadS+dpadG, w:dpadS, h:dpadS};
+        const down={x:bx+dpadS+dpadG, y:by+(dpadS+dpadG)*2, w:dpadS, h:dpadS};
+        const px=ui.pointer.x, py=ui.pointer.y;
+        if(hitRect(up,px,py)) snake.setDir(0,-1);
+        else if(hitRect(down,px,py)) snake.setDir(0,1);
+        else if(hitRect(left,px,py)) snake.setDir(-1,0);
+        else if(hitRect(right,px,py)) snake.setDir(1,0);
+      }
+    }
+    function pointerMove(){}
+    function pointerUp(){ if(ui.drag && ui.drag.type==='match'){ const d = match.draggables.find(x=>x.id===ui.drag.id); if(d) match.drop(d); ui.drag=null; } }
+
+    // ---------- Draw camera ship ----------
+    function drawCameraShip(x,y,w,h){
+      const accent = sceneColors[scene] || palette.red;
+      roundRect(x,y,w,h,10);
+      ctx.fillStyle=hexToRgba(accent, 0.15); ctx.fill();
+      ctx.strokeStyle=hexToRgba(accent, 0.40); ctx.lineWidth=1.5; ctx.stroke();
+
+      const px=x+w*0.22, py=y-h*0.40, pw=w*0.28, ph=h*0.45;
+      roundRect(px,py,pw,ph,8);
+      ctx.fillStyle=hexToRgba(accent, 0.10); ctx.fill();
+      ctx.strokeStyle=hexToRgba(accent, 0.25); ctx.stroke();
+
+      const cx=x+w*0.68, cy=y+h*0.52;
+      ctx.beginPath(); ctx.arc(cx,cy,h*0.42,0,Math.PI*2);
+      ctx.fillStyle='rgba(0,0,0,0.34)'; ctx.fill();
+      ctx.strokeStyle=hexToRgba(accent, 0.30); ctx.stroke();
+
+      ctx.beginPath(); ctx.arc(cx,cy,h*0.22,0,Math.PI*2);
+      ctx.strokeStyle=hexToRgba(accent, 0.45); ctx.lineWidth=2; ctx.stroke();
+      ctx.lineWidth=1;
+    }
+
+    // ---------- Scenes ----------
+    function drawHome(dt){
+      drawSky(dt);
+      clearButtons();
+      const pad=Math.max(18, Math.min(44, W*0.05));
+
+      // Brand title
+      ctx.fillStyle='rgba(255,255,255,0.96)';
+      ctx.font='900 42px Barlow, sans-serif';
+      ctx.textAlign='left'; ctx.textBaseline='top';
+      ctx.fillText('BACKYARD ARCADE', pad, pad);
+      // Colored accent bar under title
+      const tw = ctx.measureText('BACKYARD ARCADE').width;
+      const barColors = [palette.green, palette.blue, palette.red, palette.orange, palette.purple, palette.pink];
+      const segW = tw / barColors.length;
+      for(let i=0;i<barColors.length;i++){
+        ctx.fillStyle = hexToRgba(barColors[i], 0.85);
+        ctx.fillRect(pad + i*segW, pad+50, segW+1, 3);
+      }
+
+      ctx.fillStyle='rgba(255,255,255,0.50)';
+      ctx.font='400 14px Barlow, sans-serif';
+      ctx.fillText('Interactive study from your iNaturalist observations', pad, pad+62);
+
+      // Fullscreen toggle — sits to the left of the Load CSV button
+      const _fsLbl = document.fullscreenElement ? '⊟' : '⊞';
+      addButton(W-pad-192, pad+10, 44, 38, _fsLbl, ()=>toggleFullscreen(), {fontSize:17, r:10});
+
+      // Instruction text
+      ctx.fillStyle='rgba(255,255,255,0.35)';
+      ctx.font='400 13px Barlow, sans-serif';
+      ctx.fillText('Drop your CSV anywhere to begin  •  Press ? for shortcuts', pad, pad+86);
+
+      // Menu cards
+      const cards = [
+        { label:'Quiz',              sub:'Multiple choice identification', icon:'?', color:palette.green,  fn:()=>{ if(!state.csv.loaded) toast('Load a CSV first.','warn',2200); else { quiz.newQuestion(); goto('quiz'); } }},
+        { label:'Sorting Table',     sub:'Drag labels to match specimens', icon:'⇅', color:palette.blue,   fn:()=>{ if(!state.csv.loaded) toast('Load a CSV first.','warn',2200); else { match.reset(true); goto('match'); } }},
+        { label:'Night Walk',        sub:'Browse observations by date',    icon:'☽', color:palette.purple, fn:()=>{ if(!state.csv.loaded) return toast('Load a CSV first.','warn',2200); if(!data.nightDates.length) return toast('No date column found.','warn',3000); const d=bumpDay(); state.day[d].night++; state.lifetime.night.visits++; saveState(); night.reset(true); goto('night'); }},
+        { label:'Sheet Invaders',    sub:'Arcade shooter with your data',  icon:'▼', color:palette.red,    fn:()=>{ if(!state.csv.loaded) toast('Load a CSV first.','warn',2200); else { invaders.reset(true); goto('invaders'); } }},
+        { label:'Specimen Snake',    sub:'Collect specimens, grow longer', icon:'~', color:palette.orange,  fn:()=>{ if(!state.csv.loaded) toast('Load a CSV first.','warn',2200); else { snake.reset(true); goto('snake'); } }},
+      ];
+
+      const startY = pad + 116;
+      const availW = Math.max(320, W - pad*2);
+      const availH = H - startY - pad;
+
+      // Responsive: 2 columns if wide enough, else 1
+      const useCols = (availW >= 580) ? 2 : 1;
+      const gap = 14;
+      const cardW = useCols===2 ? Math.min(480, (availW - gap)/2) : Math.min(480, availW);
+      const cardH = Math.min(72, Math.max(58, (availH - gap*(cards.length/useCols -1)) / Math.ceil(cards.length/useCols)));
+
+      for(let i=0;i<cards.length;i++){
+        const c = cards[i];
+        const col = i % useCols;
+        const row = Math.floor(i / useCols);
+        const cx = pad + col*(cardW + gap);
+        const cy = startY + row*(cardH + gap);
+
+        addButton(cx, cy, cardW, cardH, '', c.fn, {r:14, accent:c.color});
+
+        // Icon circle
+        const iconR = cardH*0.28;
+        const iconCx = cx + 20 + iconR;
+        const iconCy = cy + cardH/2;
+        ctx.beginPath(); ctx.arc(iconCx, iconCy, iconR, 0, Math.PI*2);
+        ctx.fillStyle = hexToRgba(c.color, 0.25);
+        ctx.fill();
+        ctx.fillStyle = hexToRgba(c.color, 0.9);
+        ctx.font='700 '+(iconR*1.1)+'px Barlow, sans-serif';
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(c.icon, iconCx, iconCy);
+
+        // Label
+        const textX = iconCx + iconR + 16;
+        ctx.fillStyle='rgba(255,255,255,0.94)';
+        ctx.font='700 17px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='middle';
+        ctx.fillText(c.label, textX, cy + cardH*0.38);
+
+        // Subtitle
+        ctx.fillStyle='rgba(255,255,255,0.45)';
+        ctx.font='400 13px Barlow, sans-serif';
+        ctx.fillText(c.sub, textX, cy + cardH*0.65);
+      }
+
+      // CSV status indicator at the bottom
+      const statusY = H - pad - 20;
+      if(state.csv.loaded){
+        ctx.fillStyle = hexToRgba(palette.green, 0.6);
+        ctx.font='500 12px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='bottom';
+        ctx.fillText('● '+state.csv.filename+'  ('+state.csv.rows+' rows)', pad, statusY);
+      } else {
+        ctx.fillStyle='rgba(255,255,255,0.25)';
+        ctx.font='500 12px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='bottom';
+        ctx.fillText('○ No CSV loaded — drag and drop to begin', pad, statusY);
+      }
+
+      // Load CSV button
+      addButton(W - pad - 140, pad + 10, 140, 38, 'Load CSV', ()=>fileInput.click(), {fontSize:14, r:10, accent:palette.green});
+    }
+
+    function drawQuiz(dt){
+      drawSky(dt);
+      clearButtons();
+      const pad=Math.max(18, Math.min(44, W*0.05));
+      drawTitle(pad, pad, 'Quiz', 'Guess the '+(state.settings.quizMode==='family'?'family':'scientific name')+' from a random photo');
+      drawTopBar(pad);
+
+      // Scoreboard
+      drawPillRight(W-pad, pad+64, 'Score: '+((state.score&&state.score.quiz!=null)?state.score.quiz:0)+'  Best: '+((state.score&&state.score.quizBest!=null)?state.score.quizBest:0));
+
+      // Controls
+      const ctrlX = pad+284, ctrlY = pad+86, h = 44, gap = 8;
+      const avail = Math.max(300, (W - pad) - ctrlX);
+
+      const wNext = 130;
+      let wMode = clamp(avail*0.30, 150, 220);
+      let wOrder = clamp(avail*0.42, 170, 320);
+
+      // keep things on one line when possible
+      if(wMode + wOrder + wNext + gap*2 > avail){
+        const excess = (wMode + wOrder + wNext + gap*2) - avail;
+        wOrder = Math.max(150, wOrder - excess*0.7);
+        wMode  = Math.max(140, wMode  - excess*0.3);
+      }
+
+      let x = ctrlX;
+
+      addButton(x, ctrlY, wMode, h,
+        'Mode: '+(state.settings.quizMode==='family'?'Family':'Scientific'),
+        ()=>{ quiz.orderPicker=false; quiz.toggleMode(); },
+        {fontSize:15, r:12, primary:true}
+      );
+      x += wMode + gap;
+
+      const hasOrderCol = (data.colMap && data.colMap['taxon_order_name']!=null);
+      const ord = state.settings.quizOrder || 'All';
+      const ordLabel = (ord==='All') ? 'All orders' : ord;
+
+      addButton(x, ctrlY, wOrder, h,
+        'Order: ' + ordLabel + (hasOrderCol ? ' ▾' : ''),
+        ()=>{
+          if(!hasOrderCol) return toast('No taxon_order_name column found in this CSV.', 'info', 1700);
+          quiz.toggleOrderPicker();
+        },
+        {fontSize:14, r:12, primary: quiz.orderPicker}
+      );
+      const orderBtn = {x, y:ctrlY, w:wOrder, h};
+      x += wOrder + gap;
+
+      addButton(x, ctrlY, wNext, h, 'Next', ()=>{ quiz.orderPicker=false; quiz.newQuestion(); }, {fontSize:15, r:12});
+
+      if(!quiz.current) quiz.newQuestion();
+      const q=quiz.current;
+
+      const contentTop = pad+152;
+      const availH = Math.max(240, H - contentTop - pad);
+      const availW = Math.max(320, W - pad*2);
+      const panelGap = 16;
+
+      // Prefer side-by-side layout; squeeze image first if needed.
+      let imgW = clamp(availW*0.62, 320, 760);
+      let panelW = availW - imgW - panelGap;
+      if(panelW < 280){
+        imgW = Math.max(300, availW - 280 - panelGap);
+        panelW = availW - imgW - panelGap;
+      }
+
+      // If ultra-narrow, fall back to stacked (rare, but better than cut-off UI)
+      const useStacked = (panelW < 240);
+
+      const cardH = Math.min(availH, clamp(H*0.56, 300, 540));
+      const left = pad, top = contentTop;
+
+      // Smooth parallax pan: tracks mouse position relative to image card centre
+      const _panCx = left + (useStacked ? Math.min(660, availW) : clamp(availW*0.62, 320, 760)) * 0.5;
+      const _panCy = top + cardH * 0.5;
+      quiz._panX = lerp(quiz._panX||0, (ui.pointer.x - _panCx) / W * 14, 0.07);
+      quiz._panY = lerp(quiz._panY||0, (ui.pointer.y - _panCy) / H * 10, 0.07);
+
+      if(q && q.error){
+        ctx.fillStyle='rgba(255,255,255,0.86)';
+        ctx.font='600 16px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText(q.error, left, top);
+      }
+
+      if(!q) return;
+
+      if(!q.error){
+      // ---------- Layout: image + answers ----------
+      if(useStacked){
+        // stacked fallback (still keeps feedback on-screen by shrinking image card)
+        const cardW = Math.min(660, availW);
+        const imgCardH = Math.min(cardH, Math.max(240, H*0.42));
+        roundRect(left, top, cardW, imgCardH, 18);
+        ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.fill();
+        ctx.strokeStyle='rgba(255,255,255,0.14)'; ctx.stroke();
+
+        const rec=resolveImageRec(q);
+        if(!rec.ready){
+          ctx.fillStyle='rgba(255,255,255,0.70)';
+          ctx.font='500 14px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          ctx.fillText('Loading image…', left+18, top+18);
+        } else if(!rec.ok){
+          ctx.fillStyle='rgba(255,255,255,0.70)';
+          ctx.font='500 14px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          ctx.fillText('Image failed to load. Skipping…', left+18, top+18);
+          data.badImage.add(q.url);
+          quiz.newQuestion();
+          return;
+        } else {
+          drawFitImage({x:left, y:top, w:cardW, h:imgCardH}, rec.img, 12, 18, quiz._panX, quiz._panY);
+          addButton(left+cardW-170, top+14, 156, 40, 'Open record', ()=>{
+            try{ window.open(getRecordUrl(data.rows[q.idx]) || q.url, '_blank'); }catch(_){}
+          }, {fontSize:14, r:12});
+        }
+
+        // choices below, but we cap sizes to fit the viewport
+        const choiceTop = top + imgCardH + 16;
+        const remaining = Math.max(180, H - choiceTop - pad);
+        const cw = cardW;
+
+        const n = q.choices.length;
+        const gapY = 10;
+        const fbH = 66;
+        const headerH = 0;
+        const ch = clamp((remaining - fbH - headerH - gapY*(n-1)) / n, 40, 54);
+
+        for(let i=0;i<n;i++){
+          const label=q.choices[i];
+          const bOpts={fontSize:15, r:14};
+          if(q.picked!=null){
+            if(label===q.correct) bOpts.accent=palette.green;
+            else if(label===q.picked) bOpts.accent=palette.red;
+          }
+          if(q.picked!=null && q.pickTime!=null && label===q.correct){
+            const _e=Math.min(400, performance.now()-q.pickTime);
+            bOpts.scale = 1 + Math.sin(_e/400*Math.PI)*0.05;
+          }
+          addButton(left, choiceTop+i*(ch+gapY), cw, ch, label, ()=>{
+            if(paused) return;
+            if(q.picked!=null) return;
+            q.picked=label; q.pickTime=performance.now();
+            const ok=(label===q.correct);
+            quiz.record(ok);
+            toast(ok?'Correct.':'Not this one.', ok?'ok':'warn', 1200);
+          }, bOpts);
+        }
+
+        const fbY = choiceTop + n*(ch+gapY) + 10;
+        if(q.picked!=null){
+          const ok=(q.picked===q.correct);
+          ctx.fillStyle = ok ? hexToRgba(palette.green, 0.92) : hexToRgba(palette.red, 0.85);
+          ctx.font='800 18px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          ctx.fillText(ok?'Correct.':'Not this one.', left, fbY);
+
+          ctx.fillStyle='rgba(255,255,255,0.72)';
+          ctx.font='500 14px Barlow, sans-serif';
+          ctx.fillText('Answer: '+q.correct, left, fbY+26);
+        }
+
+      } else {
+        // side-by-side primary layout
+        const cardW = imgW;
+        const panelX = left + cardW + panelGap;
+        const panelY = top;
+        const panelH = cardH;
+
+        // Image card
+        roundRect(left, top, cardW, cardH, 18);
+        ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.fill();
+        ctx.strokeStyle='rgba(255,255,255,0.14)'; ctx.stroke();
+
+        const rec=q.img || loadImage(q.url);
+        if(!rec.ready){
+          ctx.fillStyle='rgba(255,255,255,0.70)';
+          ctx.font='500 14px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          ctx.fillText('Loading image…', left+18, top+18);
+        } else if(!rec.ok){
+          ctx.fillStyle='rgba(255,255,255,0.70)';
+          ctx.font='500 14px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          ctx.fillText('Image failed to load. Skipping…', left+18, top+18);
+          data.badImage.add(q.url);
+          quiz.newQuestion();
+          return;
+        } else {
+          drawFitImage({x:left, y:top, w:cardW, h:cardH}, rec.img, 12, 18, quiz._panX, quiz._panY);
+          addButton(left+cardW-170, top+14, 156, 40, 'Open record', ()=>{
+            try{ window.open(getRecordUrl(data.rows[q.idx]) || q.url, '_blank'); }catch(_){}
+          }, {fontSize:14, r:12});
+        }
+
+        // Answer panel
+        roundRect(panelX, panelY, panelW, panelH, 18);
+        ctx.fillStyle=hexToRgba(palette.green, 0.04); ctx.fill();
+        ctx.strokeStyle=hexToRgba(palette.green, 0.16); ctx.lineWidth=1; ctx.stroke();
+
+        const padIn = 16;
+        ctx.fillStyle='rgba(255,255,255,0.86)';
+        ctx.font='700 14px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText('Choose one:', panelX+padIn, panelY+padIn);
+
+        const n=q.choices.length;
+        const fbH = 74;
+        const gapY = 10;
+        const topY = panelY + padIn + 26;
+        const bottomY = panelY + panelH - padIn - fbH;
+
+        const availChoices = Math.max(120, bottomY - topY);
+        const ch = clamp((availChoices - gapY*(n-1)) / n, 42, 56);
+
+        for(let i=0;i<n;i++){
+          const label=q.choices[i];
+          const bOpts={fontSize:15, r:14};
+          if(q.picked!=null){
+            if(label===q.correct) bOpts.accent=palette.green;
+            else if(label===q.picked) bOpts.accent=palette.red;
+          }
+          if(q.picked!=null && q.pickTime!=null && label===q.correct){
+            const _e=Math.min(400, performance.now()-q.pickTime);
+            bOpts.scale = 1 + Math.sin(_e/400*Math.PI)*0.05;
+          }
+          addButton(panelX+padIn, topY+i*(ch+gapY), panelW-padIn*2, ch, label, ()=>{
+            if(paused) return;
+            if(q.picked!=null) return;
+            q.picked=label; q.pickTime=performance.now();
+            const ok=(label===q.correct);
+            quiz.record(ok);
+            toast(ok?'Correct.':'Not this one.', ok?'ok':'warn', 1200);
+          }, bOpts);
+        }
+
+        // Feedback pinned near bottom of panel
+        if(q.picked!=null){
+          const ok=(q.picked===q.correct);
+          const fbX = panelX + padIn;
+          const fbY = panelY + panelH - padIn - fbH;
+
+          ctx.fillStyle = ok ? hexToRgba(palette.green, 0.92) : hexToRgba(palette.red, 0.85);
+          ctx.font='900 18px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          ctx.fillText(ok?'Correct.':'Not this one.', fbX, fbY+2);
+
+          ctx.fillStyle='rgba(255,255,255,0.72)';
+          ctx.font='600 14px Barlow, sans-serif';
+          ctx.fillText('Answer: '+q.correct, fbX, fbY+30);
+
+          ctx.fillStyle='rgba(255,255,255,0.48)';
+          ctx.font='500 12px Barlow, sans-serif';
+
+        } else {
+          // subtle hint
+          ctx.fillStyle='rgba(255,255,255,0.40)';
+          ctx.font='500 12px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='bottom';
+
+        }
+      }
+
+      }
+
+      // ---------- Order picker modal ----------
+      if(quiz.orderPicker){
+        const list = ['All'].concat(data.orders||[]);
+        drawScrollPicker({
+          list,
+          modalW:      clamp(W * 0.38, 320, 480),
+          scrollOwner: quiz, scrollKey: '_scrollPx',
+          onClose:     ()=>{ quiz.orderPicker=false; },
+          title:       'Filter by Order',
+          countLabel:  list.length + ' orders',
+          accent:      palette.green,
+          isCurrent:   (o)    => o === ord,
+          getLabel:    (o)    => o === 'All' ? 'All orders' : o,
+          getCount:    (o)    => (o === 'All'
+            ? (state.settings.quizMode === 'family' ? data.idx.fam.length : data.idx.sci.length)
+            : quiz.getPool(state.settings.quizMode, o).length).toLocaleString(),
+          onSelect:    (o)    => quiz.setOrder(o)
+        });
+      }
+    }
+
+    function drawMatch(dt){
+      drawSky(dt);
+      clearButtons();
+
+      const pad=Math.max(18, Math.min(44, W*0.05));
+      drawTitle(pad, pad, 'Sorting Table', 'Drag labels onto their correct slots under each photo');
+      drawTopBar(pad);
+
+      // Scoreboard
+      drawPillRight(W-pad, pad+64, 'Score: '+((state.score&&state.score.match!=null)?state.score.match:0)+'  Best: '+((state.score&&state.score.matchBest!=null)?state.score.matchBest:0));
+
+      addButton(pad+284, pad+86, 180, 44, 'New set', ()=>{
+        if(!state.csv.loaded) return toast('Load a CSV first.', 'warn', 1600);
+        match.reset(true);
+      }, {fontSize:15, r:12, primary:true});
+      addButton(pad+474, pad+86, 180, 44, 'Return all', ()=>{
+        if(match.set && !match.set.error) match.returnAll();
+      }, {fontSize:15, r:12});
+
+      if(!match.set) match.reset(true);
+      if(match.set && match.set.error){
+        ctx.fillStyle='rgba(255,255,255,0.86)';
+        ctx.font='600 16px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText(match.set.error, pad, pad+140);
+        return;
+      }
+
+      match.layout();
+
+      const items=match.set.items;
+      const top=pad+138;
+      const cardW=Math.min(360, (W - pad*2 - 24)/3);
+      const cardH=Math.min(320, H*0.36);
+      const gap=Math.max(12, (W - pad*2 - cardW*3)/2);
+
+      for(let i=0;i<3;i++){
+        const cx=pad + i*(cardW+gap);
+        const cy=top;
+        roundRect(cx,cy,cardW,cardH,18);
+        ctx.fillStyle=hexToRgba(palette.blue, 0.06); ctx.fill();
+        ctx.strokeStyle=hexToRgba(palette.blue, 0.22); ctx.lineWidth=1; ctx.stroke();
+
+        const rec=items[i].img;
+        if(rec.ready && rec.ok && rec.img){
+          drawFitImage({x:cx, y:cy, w:cardW, h:cardH}, rec.img, 10, 18);
+        } else {
+          ctx.fillStyle='rgba(255,255,255,0.70)';
+          ctx.font='600 14px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          ctx.fillText('Loading…', cx+14, cy+14);
+        }
+      }
+
+      // Determine which slot is being hovered during drag
+      const dragActive = ui.drag && ui.drag.type==='match';
+      let hoveredSlot = null;
+      let draggedLabel = null;
+      if(dragActive){
+        draggedLabel = match.draggables.find(x=>x.id===ui.drag.id);
+        if(draggedLabel){
+          for(const s of match.slots){
+            if(s.kind !== draggedLabel.kind) continue;
+            if(hitRect(s, ui.pointer.x, ui.pointer.y)){
+              hoveredSlot = s;
+              break;
+            }
+          }
+        }
+      }
+
+      for(const s of match.slots){
+        const isDropTarget = (hoveredSlot === s);
+        roundRect(s.x,s.y,s.w,s.h,16);
+
+        if(isDropTarget){
+          // Highlighted drop zone
+          ctx.fillStyle=hexToRgba(palette.blue, 0.18); ctx.fill();
+          ctx.strokeStyle=hexToRgba(palette.blue, 0.55); ctx.lineWidth=2; ctx.stroke();
+          ctx.lineWidth=1;
+          // Pulsing inner glow
+          roundRect(s.x+3,s.y+3,s.w-6,s.h-6,13);
+          ctx.strokeStyle=hexToRgba(palette.blue, 0.20); ctx.stroke();
+        } else {
+          ctx.fillStyle=hexToRgba(palette.blue, 0.06); ctx.fill();
+          ctx.strokeStyle=hexToRgba(palette.blue, 0.18); ctx.lineWidth=1; ctx.stroke();
+        }
+
+        ctx.fillStyle = isDropTarget ? hexToRgba(palette.blue, 0.85) : 'rgba(255,255,255,0.62)';
+        ctx.font='800 12px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText(s.kind==='sci'?'Scientific name':'Family', s.x+12, s.y+10);
+
+        if(s.holds){
+          const d=match.draggables.find(x=>x.id===s.holds);
+          if(d){
+            ctx.fillStyle='rgba(255,255,255,0.92)';
+            ctx.font='650 15px Barlow, sans-serif';
+            const vLines = wrapText(d.text, s.w-24, ctx.font);
+            let yy=s.y+26;
+            for(const ln of vLines.slice(0,2)){
+              ctx.fillText(ln, s.x+12, yy);
+              yy+=18;
+            }
+          }
+        } else {
+          ctx.fillStyle = isDropTarget ? hexToRgba(palette.blue, 0.50) : 'rgba(255,255,255,0.30)';
+          ctx.font='600 14px Barlow, sans-serif';
+          ctx.textAlign='right'; ctx.textBaseline='middle';
+          ctx.fillText(isDropTarget ? 'release to place' : 'drop here', s.x+s.w-12, s.y+s.h/2);
+        }
+      }
+
+      // Draw non-dragged labels first (below), then the dragged one last (on top)
+      for(const d0 of match.draggables){
+        if(d0.placed) continue;
+        if(dragActive && d0 === draggedLabel) continue; // draw later, on top
+
+        const isHovered = !dragActive && hitRect(d0, ui.pointer.x, ui.pointer.y);
+        roundRect(d0.x,d0.y,d0.w,d0.h,16);
+        ctx.fillStyle = isHovered ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.12)';
+        ctx.fill();
+        ctx.strokeStyle = isHovered ? hexToRgba(palette.blue, 0.35) : 'rgba(255,255,255,0.22)';
+        ctx.lineWidth=1; ctx.stroke();
+        ctx.fillStyle='rgba(255,255,255,0.94)';
+        ctx.font='650 15px Barlow, sans-serif';
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        const vLines = wrapText(d0.text, d0.w-20, ctx.font);
+        if(vLines.length===1) ctx.fillText(vLines[0], d0.x+d0.w/2, d0.y+d0.h/2);
+        else {
+          ctx.fillText(vLines[0], d0.x+d0.w/2, d0.y+d0.h/2-10);
+          ctx.fillStyle='rgba(255,255,255,0.86)';
+          ctx.font='650 14px Barlow, sans-serif';
+          ctx.fillText(vLines[1], d0.x+d0.w/2, d0.y+d0.h/2+10);
+        }
+      }
+
+      // Draw the actively dragged label on top with a "lifted" look
+      if(dragActive && draggedLabel && !draggedLabel.placed){
+        const d0 = draggedLabel;
+
+        // Shadow underneath (offset down)
+        roundRect(d0.x+2, d0.y+4, d0.w, d0.h, 16);
+        ctx.fillStyle='rgba(0,0,0,0.30)'; ctx.fill();
+
+        // Lifted card
+        roundRect(d0.x, d0.y, d0.w, d0.h, 16);
+        ctx.fillStyle=hexToRgba(palette.blue, 0.22); ctx.fill();
+        ctx.strokeStyle=hexToRgba(palette.blue, 0.65); ctx.lineWidth=2; ctx.stroke();
+        ctx.lineWidth=1;
+
+        // Blue accent bar on left edge
+        roundRect(d0.x, d0.y, 4, d0.h, 2);
+        ctx.fillStyle=hexToRgba(palette.blue, 0.85); ctx.fill();
+
+        // Text
+        ctx.fillStyle='rgba(255,255,255,1)';
+        ctx.font='700 15px Barlow, sans-serif';
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        const vLines = wrapText(d0.text, d0.w-20, ctx.font);
+        if(vLines.length===1) ctx.fillText(vLines[0], d0.x+d0.w/2, d0.y+d0.h/2);
+        else {
+          ctx.fillText(vLines[0], d0.x+d0.w/2, d0.y+d0.h/2-10);
+          ctx.fillStyle='rgba(255,255,255,0.92)';
+          ctx.font='700 14px Barlow, sans-serif';
+          ctx.fillText(vLines[1], d0.x+d0.w/2, d0.y+d0.h/2+10);
+        }
+      }
+    }
+
+    function drawInvaders(dt){
+      drawSky(dt);
+      clearButtons();
+
+      const pad=Math.max(18, Math.min(44, W*0.05));
+      drawTitle(pad, pad, 'Sheet Invaders', 'classic march • enemy fire • camera-ship • labels from your CSV');
+      drawTopBar(pad);
+
+      addButton(pad+284, pad+86, 180, 44, 'Restart', ()=>{
+        if(!state.csv.loaded) return toast('Load a CSV first.', 'warn', 1600);
+        invaders.reset(true);
+      }, {fontSize:15, r:12, primary:true});
+      // Label mode toggle (Family vs Scientific) — right-aligned so it never overlaps other controls
+      const labelW = 260;
+      let labelX = pad+474;
+      if(labelX + labelW > W - pad) labelX = (W - pad) - labelW;
+      addButton(labelX, pad+86, labelW, 44,
+        'Label: ' + (state.settings.invaderLabel==='family' ? 'Family' : 'Scientific'),
+        ()=>invaders.toggleLabelMode(),
+        {fontSize:15, r:12}
+      );
+
+      const ar=gameAreaRect(pad);
+
+      // HUD left
+      ctx.fillStyle='rgba(255,255,255,0.86)';
+      ctx.font='700 16px Barlow, sans-serif';
+      ctx.textAlign='left'; ctx.textBaseline='top';
+      ctx.fillText('Score: '+invaders.score+'   Lives: '+invaders.lives+'   Best: '+state.lifetime.invaders.best+'   Level: '+invaders.level, pad, pad+126);
+// Side panel
+const sx=ar.sx, sy=ar.sy, sw=ar.sw, sh=ar.h;
+
+const aliveCount = invaders.enemies.filter(e=>e && e.alive).length;
+const acc = invaders.stats.shots ? Math.round(100*invaders.stats.hits/Math.max(1,invaders.stats.shots)) : 0;
+
+const topH=78;
+roundRect(sx, sy, sw, topH, 18);
+ctx.fillStyle=hexToRgba(palette.red, 0.08); ctx.fill();
+ctx.strokeStyle=hexToRgba(palette.red, 0.22); ctx.lineWidth=1; ctx.stroke();
+
+ctx.fillStyle=hexToRgba(palette.red, 0.90);
+ctx.font='900 12px Barlow, sans-serif';
+ctx.textAlign='left'; ctx.textBaseline='top';
+ctx.fillText('WAVE', sx+12, sy+10);
+
+ctx.fillStyle='rgba(255,255,255,0.82)';
+ctx.font='850 14px Barlow, sans-serif';
+ctx.fillText('Enemies: '+aliveCount, sx+12, sy+30);
+ctx.fillText('Accuracy: '+acc+'%', sx+12, sy+50);
+
+ctx.fillStyle='rgba(255,255,255,0.48)';
+ctx.font='700 12px Barlow, sans-serif';
+ctx.textAlign='right'; ctx.textBaseline='top';
+ctx.fillText(invaders.ufo ? 'Bonus specimen!' : '', sx+sw-12, sy+50);
+
+// Captured card
+const cardY=sy+topH+12;
+const cardH=sh - topH - 12;
+roundRect(sx, cardY, sw, cardH, 18);
+ctx.fillStyle=hexToRgba(palette.red, 0.05); ctx.fill();
+ctx.strokeStyle=hexToRgba(palette.red, 0.14); ctx.lineWidth=1; ctx.stroke();
+
+ctx.fillStyle=hexToRgba(palette.red, 0.85);
+ctx.font='800 12px Barlow, sans-serif';
+ctx.textAlign='left'; ctx.textBaseline='top';
+ctx.fillText('LAST CAPTURED', sx+12, cardY+10);
+
+const hit=invaders.lastHit;
+if(hit){
+  const imgBox={x:sx+12, y:cardY+30, w:sw-24, h:Math.min(190, cardH*0.40)};
+  roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,14);
+  ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.stroke();
+
+  if(hit.img && hit.img.ready && hit.img.ok && hit.img.img){
+    drawFitImage(imgBox, hit.img.img, 5, 14);
+  }
+
+  const labelMode=state.settings.invaderLabel;
+  const big=(labelMode==='family') ? (hit.fam||'(no family)') : (hit.sci||'(unknown)');
+  const other=(labelMode==='family') ? (hit.sci||'') : (hit.fam||'');
+  const common=(hit.common||'');
+
+  let ty=imgBox.y+imgBox.h+12;
+
+  ctx.fillStyle='rgba(255,255,255,0.92)';
+  ctx.font='900 18px Barlow, sans-serif';
+  const lines=wrapText(big, sw-24, ctx.font);
+  for(const ln of lines.slice(0,2)){ ctx.fillText(ln, sx+12, ty); ty+=22; }
+
+  if(common){
+    ctx.fillStyle='rgba(255,255,255,0.78)';
+    ctx.font='750 14px Barlow, sans-serif';
+    const cl=wrapText(common, sw-24, ctx.font);
+    for(const ln of cl.slice(0,2)){ ctx.fillText(ln, sx+12, ty); ty+=18; }
+  }
+
+  if(other){
+    ctx.fillStyle='rgba(255,255,255,0.64)';
+    ctx.font='700 13px Barlow, sans-serif';
+    const ol=wrapText(other, sw-24, ctx.font);
+    for(const ln of ol.slice(0,2)){ ctx.fillText(ln, sx+12, ty); ty+=16; }
+  }
+
+  const by=cardY+cardH-48;
+  addButton(sx+12, by, sw-24, 40, 'Open record', ()=>{
+    const u=hit.recordUrl || hit.url;
+    if(u){ try{ window.open(u,'_blank'); }catch(_){} }
+    else toast('No URL column found.', 'warn', 1500);
+  }, {fontSize:14, r:12, primary:true});
+} else {
+  ctx.fillStyle='rgba(255,255,255,0.52)';
+  ctx.font='600 14px Barlow, sans-serif';
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText('Shoot a specimen to see it here.', sx+12, cardY+40);
+}
+
+if(!paused && invaders.lives>0) invaders.update(dt);
+
+      // playfield
+      roundRect(ar.x, ar.y, ar.w, ar.h, 22);
+      ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.stroke();
+// enemies (formation + divers) + bonus UFO
+if(invaders.grid){
+  const {cols, cell, size}=invaders.grid;
+
+  // Bonus specimen (UFO)
+  if(invaders.ufo && invaders.ufo.alive && invaders.ufo.e){
+    const u=invaders.ufo;
+    const cx=u.x, cy=u.y;
+
+    ctx.beginPath(); ctx.arc(cx,cy,size*0.54,0,Math.PI*2);
+    ctx.fillStyle='rgba(255,255,255,0.08)'; ctx.fill();
+    ctx.strokeStyle='rgba(255,255,255,0.34)'; ctx.stroke();
+
+    const rec=u.e.img;
+    if(rec && rec.ready && rec.ok && rec.img){
+      const d = Math.round(size*0.96);
+      const cached = getCircleImage(rec.img, d);
+      if(cached){
+        ctx.globalAlpha=0.98;
+        ctx.drawImage(cached, cx-d/2, cy-d/2, d, d);
+        ctx.globalAlpha=1;
+      }
+    }
+
+    ctx.fillStyle='rgba(255,255,255,0.76)';
+    ctx.font='900 11px Barlow, sans-serif';
+    ctx.textAlign='center'; ctx.textBaseline='top';
+    ctx.fillText('+60', cx, cy+size*0.56);
+  }
+
+  const scan = keysDown.has('l') || keysDown.has('L');
+
+  for(let i=0;i<invaders.enemies.length;i++){
+    const e=invaders.enemies[i];
+    if(!e || !e.alive) continue;
+
+    let cx, cy;
+    if(e.detached){
+      cx=e.x; cy=e.y;
+    } else {
+      const c=i%cols, r=Math.floor(i/cols);
+      const ex=invaders.groupX + c*cell;
+      const ey=invaders.groupY + r*cell;
+      cx=ex+size/2; cy=ey+size/2;
+    }
+
+    ctx.beginPath(); ctx.arc(cx,cy,size*0.52,0,Math.PI*2);
+    ctx.fillStyle = e.detached ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.07)';
+    ctx.fill();
+    ctx.strokeStyle = e.detached ? 'rgba(255,255,255,0.30)' : 'rgba(255,255,255,0.16)';
+    ctx.stroke();
+
+    const rec=e.img;
+    if(rec && rec.ready && rec.ok && rec.img){
+      const d = Math.round(size*0.92);
+      const cached = getCircleImage(rec.img, d);
+      if(cached){
+        ctx.globalAlpha=0.98;
+        ctx.drawImage(cached, cx-d/2, cy-d/2, d, d);
+        ctx.globalAlpha=1;
+      }
+    } else {
+      ctx.fillStyle='rgba(255,255,255,0.10)';
+      ctx.font='700 12px Barlow, sans-serif';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText('…', cx, cy);
+    }
+
+    // Educational scan overlay (hold L)
+    if(scan){
+      const labelMode=state.settings.invaderLabel;
+      const t = (labelMode==='family') ? (e.fam||'') : (e.sci||'');
+      if(t){
+        ctx.font='800 10px Barlow, sans-serif';
+        const maxW = Math.max(54, size*1.25);
+        const lines = wrapText(t, maxW, ctx.font);
+        ctx.textAlign='center'; ctx.textBaseline='top';
+        const y0 = cy + size*0.56;
+        for(let li=0; li<Math.min(2, lines.length); li++){
+          const w = ctx.measureText(lines[li]).width;
+          ctx.fillStyle='rgba(0,0,0,0.35)';
+          roundRect(cx - w/2 - 6, y0 + li*12 - 1, w+12, 12, 6);
+          ctx.fill();
+          ctx.fillStyle='rgba(255,255,255,0.82)';
+          ctx.fillText(lines[li], cx, y0 + li*12);
+        }
+      }
+    }
+  }
+}
+
+      for(const b of invaders.bullets){
+        ctx.beginPath(); ctx.arc(b.x,b.y,4,0,Math.PI*2);
+        ctx.fillStyle='rgba(255,255,255,0.85)'; ctx.fill();
+      }
+      for(const b of invaders.ebullets){
+        ctx.beginPath(); ctx.arc(b.x,b.y,3.5,0,Math.PI*2);
+        ctx.fillStyle='rgba(255,255,255,0.40)'; ctx.fill();
+      }
+
+      drawCameraShip(invaders.ship.x, invaders.ship.y, invaders.ship.w, invaders.ship.h);
+
+      ctx.fillStyle='rgba(255,255,255,0.54)';
+      ctx.font='600 13px Barlow, sans-serif';
+      ctx.textAlign='left'; ctx.textBaseline='bottom';
+
+      if(invaders.lives<=0){
+        roundRect(ar.x, ar.y, ar.w, ar.h, 22);
+        ctx.fillStyle='rgba(0,0,0,0.62)'; ctx.fill();
+
+        const _pw=Math.min(360, ar.w*0.74), _ph=198;
+        const _px=ar.x+(ar.w-_pw)/2, _py=ar.y+(ar.h-_ph)/2;
+        roundRect(_px, _py, _pw, _ph, 20);
+        ctx.fillStyle='rgba(16,5,22,0.97)'; ctx.fill();
+        ctx.strokeStyle=hexToRgba(palette.red, 0.46); ctx.lineWidth=1.5; ctx.stroke(); ctx.lineWidth=1;
+
+        ctx.textAlign='center'; ctx.textBaseline='top';
+        ctx.fillStyle=hexToRgba(palette.red, 0.96);
+        ctx.font='900 22px Barlow, sans-serif';
+        ctx.fillText('GAME OVER', _px+_pw/2, _py+16);
+
+        ctx.fillStyle='rgba(255,255,255,0.80)';
+        ctx.font='700 14px Barlow, sans-serif';
+        ctx.fillText('Score: '+invaders.score+'  ·  Level: '+invaders.level, _px+_pw/2, _py+50);
+        ctx.fillText('Hits: '+invaders.stats.hits+'  ·  Accuracy: '+acc+'%', _px+_pw/2, _py+72);
+
+        if(state.lifetime.invaders.best>0){
+          ctx.fillStyle='rgba(255,255,255,0.44)';
+          ctx.font='600 12px Barlow, sans-serif';
+          ctx.fillText('Best: '+state.lifetime.invaders.best, _px+_pw/2, _py+96);
+        }
+
+        addButton(_px+(_pw-160)/2, _py+_ph-52, 160, 38, 'Play again', ()=>invaders.reset(true), {fontSize:14, r:12, primary:true});
+      }
+    }
+
+    function drawSnake(dt){
+      drawSky(dt);
+      clearButtons();
+
+      const pad=Math.max(18, Math.min(44, W*0.05));
+      drawTitle(pad, pad, 'Specimen Snake', 'collect specimens from your CSV • arrows or on-screen pad');
+      drawTopBar(pad);
+
+      addButton(pad+284, pad+86, 180, 44, 'Restart', ()=>{
+        if(!state.csv.loaded) return toast('Load a CSV first.', 'warn', 1600);
+        snake.reset(true);
+      }, {fontSize:15, r:12, primary:true});
+      addButton(pad+474, pad+86, 180, 44, (snake.voiceOn ? 'Voice: On' : 'Voice: Off'), ()=>{
+        snake.voiceOn = !snake.voiceOn;
+        state.settings.snakeVoice = snake.voiceOn;
+        saveState();
+        toast(snake.voiceOn ? 'Voice on' : 'Voice off', 'info', 900);
+      }, {fontSize:15, r:12});
+
+      const ar=gameAreaRect(pad);
+
+      ctx.fillStyle='rgba(255,255,255,0.86)';
+      ctx.font='700 16px Barlow, sans-serif';
+      ctx.textAlign='left'; ctx.textBaseline='top';
+      ctx.fillText('Score: '+snake.score+'   Best: '+state.lifetime.snake.best, pad, pad+126);
+      // sidebar (target specimen)
+      const sx=ar.sx, sy=ar.sy, sw=ar.sw, sh=ar.h;
+      const padS=12;
+
+      roundRect(sx, sy, sw, sh, 18);
+      ctx.fillStyle=hexToRgba(palette.orange, 0.06); ctx.fill();
+      ctx.strokeStyle=hexToRgba(palette.orange, 0.18); ctx.lineWidth=1; ctx.stroke();
+
+      ctx.fillStyle=hexToRgba(palette.orange, 0.90);
+      ctx.font='900 12px Barlow, sans-serif';
+      ctx.textAlign='left'; ctx.textBaseline='top';
+      const now=performance.now();
+      const showingCaptured = snake.flashSpec && (now < snake.flashUntil);
+
+      ctx.fillText(showingCaptured ? 'CAPTURED' : 'TARGET', sx+padS, sy+padS);
+
+      const target = showingCaptured ? snake.flashSpec : snake.food;
+      if(target){
+        const imgBox={x:sx+padS, y:sy+padS+26, w:sw-padS*2, h:Math.min(200, sh*0.48)};
+        roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,14);
+        ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.fill();
+        ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.stroke();
+
+        if(target.img && target.img.ready && target.img.ok && target.img.img){
+          drawFitImage(imgBox, target.img.img, 5, 14);
+        } else {
+          ctx.fillStyle='rgba(255,255,255,0.40)';
+          ctx.font='700 12px Barlow, sans-serif';
+          ctx.textAlign='center'; ctx.textBaseline='middle';
+          ctx.fillText('loading…', imgBox.x+imgBox.w/2, imgBox.y+imgBox.h/2);
+        }
+
+        let ty=imgBox.y+imgBox.h+12;
+
+        if(target.common){
+          ctx.fillStyle='rgba(255,255,255,0.86)';
+          ctx.font='800 14px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          const cl=wrapText(target.common, sw-padS*2, ctx.font);
+          for(const ln of cl.slice(0,2)){ ctx.fillText(ln, sx+padS, ty); ty+=18; }
+          ty+=2;
+        }
+
+        ctx.fillStyle='rgba(255,255,255,0.78)';
+        ctx.font='750 13px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        const sl=wrapText(target.sci || '(unknown)', sw-padS*2, ctx.font);
+        for(const ln of sl.slice(0,2)){ ctx.fillText(ln, sx+padS, ty); ty+=16; }
+
+        ctx.fillStyle='rgba(255,255,255,0.62)';
+        ctx.font='700 13px Barlow, sans-serif';
+        const fl=wrapText('Family: '+(target.fam||'(no family)'), sw-padS*2, ctx.font);
+        for(const ln of fl.slice(0,2)){ ctx.fillText(ln, sx+padS, ty); ty+=16; }
+
+        const by=sy+sh-52;
+        addButton(sx+padS, by, sw-padS*2, 40, 'Open record', ()=>{
+          const u=target.recordUrl || target.url;
+          try{ window.open(u, '_blank'); }catch(_){}
+        }, {fontSize:14, r:12});
+      } else {
+        ctx.fillStyle='rgba(255,255,255,0.55)';
+        ctx.font='700 14px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText('No target yet.', sx+padS, sy+padS+30);
+      }
+
+      if(!paused && snake.alive) snake.update(dt);
+
+      roundRect(ar.x, ar.y, ar.w, ar.h, 22);
+      ctx.fillStyle='rgba(0,0,0,0.10)'; ctx.fill();
+      ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.stroke();
+
+      const cell=snake.cell;
+      const gx=ar.x, gy=ar.y;
+
+      // FOOD
+      if(snake.food){
+        const fx=gx + snake.food.x*cell + cell/2;
+        const fy=gy + snake.food.y*cell + cell/2;
+        const r=cell*0.78; // target specimen size
+
+        ctx.beginPath(); ctx.arc(fx,fy,r,0,Math.PI*2);
+        ctx.fillStyle='rgba(255,255,255,0.09)'; ctx.fill();
+        ctx.strokeStyle='rgba(255,255,255,0.20)'; ctx.stroke();
+
+        if(snake.food.img && snake.food.img.ready && snake.food.img.ok && snake.food.img.img){
+          drawCircleImageCover(snake.food.img.img, fx, fy, r*0.92, 0.98);
+        }
+
+        if(snake.food.isForbidden){
+          ctx.beginPath(); ctx.arc(fx,fy,r*1.05,0,Math.PI*2);
+          ctx.strokeStyle='rgba(255,60,60,0.92)'; ctx.lineWidth=4; ctx.stroke(); ctx.lineWidth=1;
+        }
+      }
+
+      // snake
+      for(let i=snake.body.length-1;i>=0;i--){
+        const p=snake.body[i];
+        const px=gx + p.x*cell;
+        const py=gy + p.y*cell;
+        const isHead = (i===0);
+        roundRect(px+1, py+1, cell-2, cell-2, 10);
+        ctx.fillStyle = isHead ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.14)';
+        ctx.fill();
+        ctx.strokeStyle='rgba(255,255,255,'+(isHead?0.28:0.18)+')';
+        ctx.stroke();
+
+        if(isHead){
+          ctx.beginPath();
+          ctx.arc(px+cell*0.66, py+cell*0.38, 2.2, 0, Math.PI*2);
+          ctx.fillStyle='rgba(255,255,255,0.62)';
+          ctx.fill();
+        }
+      }
+
+      // capture flash: brief centred overlay when a specimen is eaten
+      if(snake.flashSpec && performance.now() < snake.flashUntil){
+        const _now=performance.now();
+        const _age=1200-(snake.flashUntil-_now);
+        const _fa=Math.sin(_age/1200*Math.PI);
+        const _spec=snake.flashSpec;
+        const _cr=Math.min(ar.w,ar.h)*0.26;
+        const _cx=ar.x+ar.w/2, _cy=ar.y+ar.h/2-10;
+
+        ctx.globalAlpha=_fa*0.38;
+        ctx.beginPath(); ctx.arc(_cx,_cy,_cr*1.5,0,Math.PI*2);
+        ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fill();
+        ctx.globalAlpha=1;
+
+        if(_spec.img && _spec.img.ready && _spec.img.ok && _spec.img.img){
+          const _d=Math.round(_cr*2);
+          const _cached=getCircleImage(_spec.img.img, _d);
+          if(_cached){ ctx.globalAlpha=_fa; ctx.drawImage(_cached,_cx-_cr,_cy-_cr,_d,_d); ctx.globalAlpha=1; }
+        }
+
+        ctx.globalAlpha=_fa*0.75;
+        ctx.beginPath(); ctx.arc(_cx,_cy,_cr,0,Math.PI*2);
+        ctx.strokeStyle=hexToRgba(palette.orange,0.95); ctx.lineWidth=3; ctx.stroke(); ctx.lineWidth=1;
+        ctx.globalAlpha=1;
+
+        const _name=_spec.common||_spec.sci||'';
+        if(_name){
+          ctx.globalAlpha=_fa;
+          ctx.fillStyle='rgba(255,255,255,0.94)';
+          ctx.font='900 15px Barlow, sans-serif';
+          ctx.textAlign='center'; ctx.textBaseline='top';
+          ctx.fillText(_name.length>32?_name.slice(0,29)+'…':_name, _cx, _cy+_cr+8);
+          ctx.globalAlpha=1;
+        }
+      }
+
+      // D-pad — positioned below the game area
+      const dpadS = 42, dpadG = 6;
+      const dpadW = dpadS*3 + dpadG*2;
+      const dpadBx = ar.x + (ar.w - dpadW)/2;  // centered under the game
+      const dpadBy = ar.y + ar.h + 14;
+
+      const upB    = {x:dpadBx+dpadS+dpadG, y:dpadBy,                w:dpadS, h:dpadS, label:'▲'};
+      const leftB  = {x:dpadBx,             y:dpadBy+dpadS+dpadG,    w:dpadS, h:dpadS, label:'◀'};
+      const rightB = {x:dpadBx+(dpadS+dpadG)*2, y:dpadBy+dpadS+dpadG, w:dpadS, h:dpadS, label:'▶'};
+      const downB  = {x:dpadBx+dpadS+dpadG, y:dpadBy+(dpadS+dpadG)*2, w:dpadS, h:dpadS, label:'▼'};
+      for(const b of [upB,leftB,rightB,downB]){
+        roundRect(b.x,b.y,b.w,b.h,11);
+        ctx.fillStyle=hexToRgba(palette.orange, 0.08); ctx.fill();
+        ctx.strokeStyle=hexToRgba(palette.orange, 0.22); ctx.lineWidth=1; ctx.stroke();
+        ctx.fillStyle='rgba(255,255,255,0.72)';
+        ctx.font='900 15px Barlow, sans-serif';
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(b.label, b.x+b.w/2, b.y+b.h/2+1);
+        addButton(b.x, b.y, b.w, b.h, '', (()=>{
+          const lbl=b.label;
+          return ()=>{
+            if(lbl==='▲') snake.setDir(0,-1);
+            else if(lbl==='▼') snake.setDir(0,1);
+            else if(lbl==='◀') snake.setDir(-1,0);
+            else if(lbl==='▶') snake.setDir(1,0);
+          };
+        })(), {ghost:true});
+      }
+
+      ctx.fillStyle='rgba(255,255,255,0.54)';
+      ctx.font='600 13px Barlow, sans-serif';
+      ctx.textAlign='left'; ctx.textBaseline='bottom';
+
+      if(!snake.alive){
+        ctx.fillStyle='rgba(255,255,255,0.88)';
+        ctx.font='900 22px Barlow, sans-serif';
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText('Game over', ar.x+ar.w/2, ar.y+ar.h/2);
+      }
+    }
+
+    function drawNight(dt){
+      drawSky(dt);
+      clearButtons();
+
+      const pad=Math.max(18, Math.min(44, W*0.05));
+      const st=night.sessionStats();
+      const subtitle = night.currentDate() + '  ·  ' + st.records + ' records  ·  ' + st.species + ' species  ·  ' + st.families + ' families';
+      drawTitle(pad, pad, 'Night Walk', subtitle);
+      drawTopBar(pad);
+
+      const ar=gameAreaRect(pad);
+
+      // top controls (date + family filtering)
+      const ctrlX = pad+284, ctrlY = pad+86, h = 44, gap = 8;
+      const avail = Math.max(320, (W - pad) - ctrlX);
+
+      const wArrow = 40, wAuto = 130, wReset = 88, wSwarm = 88;
+      const fixed = (wArrow*2 + wAuto + wReset + wSwarm + gap*6);
+      let rem = Math.max(160, avail - fixed);
+
+      let wFam = 0;
+      let wDate = rem;
+      if(data.keys.family){
+        wFam = clamp(rem*0.46, 130, 220);
+        wDate = clamp(rem - wFam, 150, 260);
+        const excess = (wDate + wFam) - rem;
+        if(excess > 0){ wDate -= excess*0.55; wFam -= excess*0.45; }
+      } else {
+        wDate = clamp(rem, 170, 320);
+      }
+
+      let x = ctrlX;
+      addButton(x, ctrlY, wArrow, h, '◀', ()=>night.prevDate(), {fontSize:16, r:12}); x += wArrow + gap;
+      addButton(x, ctrlY, wDate, h, ('Date: ' + night.currentDate() + ' ▾'), ()=>night.toggleDatePicker(), {fontSize:14, r:12, primary: night.datePicker}); x += wDate + gap;
+      addButton(x, ctrlY, wArrow, h, '▶', ()=>night.nextDate(), {fontSize:16, r:12}); x += wArrow + gap;
+
+      if(data.keys.family){
+        const famLabel = night.familyFilter==='All' ? 'All families' : night.familyFilter;
+        addButton(x, ctrlY, wFam, h, ('Family: ' + famLabel + ' ▾'), ()=>night.toggleFamilyPicker(), {fontSize:14, r:12, primary: night.familyPicker}); x += wFam + gap;
+      } else {
+        addButton(x, ctrlY, 170, h, 'Family: n/a', ()=>toast('No family column found in CSV.', 'info', 1200), {fontSize:14, r:12}); x += 170 + gap;
+      }
+
+      addButton(x, ctrlY, wAuto, h, night.autoplay?'Auto: on':'Auto: off', ()=>night.toggleAuto(), {fontSize:14, r:12, primary: night.autoplay}); x += wAuto + gap;
+      addButton(x, ctrlY, wReset, h, 'Reset', ()=>night.loadDate(night.currentDate()), {fontSize:14, r:12}); x += wReset + gap;
+      addButton(x, ctrlY, wSwarm, h, 'Swarm', ()=>night.swarm(), {fontSize:14, r:12});
+
+      if(!state.csv.loaded){
+        ctx.fillStyle='rgba(255,255,255,0.78)';
+        ctx.font='600 16px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText('Load a CSV first.', pad, pad+140);
+        return;
+      }
+      if(!data.nightDates.length){
+        ctx.fillStyle='rgba(255,255,255,0.78)';
+        ctx.font='600 16px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText('No date column found for Night Walk.', pad, pad+140);
+        return;
+      }
+
+      // left "sheet"
+      const sheet={x:ar.x+22, y:ar.y+22, w:ar.w-44, h:ar.h-44};
+      roundRect(sheet.x, sheet.y, sheet.w, sheet.h, 26);
+      ctx.fillStyle=hexToRgba(palette.purple, 0.05); ctx.fill();
+      ctx.strokeStyle=hexToRgba(palette.purple, 0.16); ctx.lineWidth=1; ctx.stroke();
+
+      // subtle inner "sheet glow"
+      const glow=ctx.createRadialGradient(sheet.x+sheet.w*0.5, sheet.y+sheet.h*0.30, sheet.w*0.1, sheet.x+sheet.w*0.5, sheet.y+sheet.h*0.30, sheet.w*0.9);
+      glow.addColorStop(0,hexToRgba(palette.purple, 0.06));
+      glow.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.fillStyle=glow;
+      ctx.fillRect(sheet.x, sheet.y, sheet.w, sheet.h);
+
+      // If filtered to zero, gently explain
+      if(night.familyFilter!=='All' && st.records===0){
+        ctx.fillStyle='rgba(255,255,255,0.74)';
+        ctx.font='500 13px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText('No records for that family on this date — change the Family filter.', pad, pad+166);
+      }
+
+      // update
+      if(!paused) night.update(dt, sheet);
+
+      // pre-compute family sort + hover family (used by sprite ring and sidebar)
+      const _famRowH=26, _famRowGap=3, _famRowStep=29;
+      const _sortedFams=[...night.seenFamilies].sort((a,b)=>b.count-a.count);
+      const _visRows=Math.max(2, Math.floor(ar.h*0.36 / _famRowStep));
+      const _clampedScrollRow=clamp(night._famLegendScrollRow||0, 0, Math.max(0, _sortedFams.length-_visRows));
+      night._famLegendScrollRow=_clampedScrollRow;
+      const _famListTop=ar.sy+26, _famListBottom=_famListTop+_visRows*_famRowStep;
+      let _hoverFam=null;
+      if(!night.datePicker && !night.familyPicker
+         && ui.pointer.x>=ar.sx && ui.pointer.x<=ar.sx+ar.sw
+         && ui.pointer.y>=_famListTop && ui.pointer.y<_famListBottom){
+        const _hRow=Math.floor((ui.pointer.y-_famListTop)/_famRowStep);
+        const _absRow=_hRow+_clampedScrollRow;
+        if(_absRow>=0 && _absRow<_sortedFams.length) _hoverFam=_sortedFams[_absRow].fam;
+      }
+
+      // draw arrivals
+      for(const sp of night.sprites){
+        const r = 34*sp.s;
+        const _dim = (_hoverFam && sp.fam!==_hoverFam && night.selected!==sp) ? 0.22 : 1.0;
+        const shadow = 0.22*sp.a*_dim;
+        ctx.beginPath(); ctx.arc(sp.x, sp.y+4, r*0.95, 0, Math.PI*2);
+        ctx.fillStyle='rgba(0,0,0,'+shadow+')'; ctx.fill();
+
+        ctx.beginPath(); ctx.arc(sp.x, sp.y, r, 0, Math.PI*2);
+        ctx.fillStyle='rgba(255,255,255,'+(0.08*sp.a*_dim)+')'; ctx.fill();
+        ctx.strokeStyle='rgba(255,255,255,'+(0.16*sp.a*_dim)+')'; ctx.stroke();
+
+        if(sp.img && sp.img.ready && sp.img.ok && sp.img.img){
+          const d = Math.round(r*2*0.92);
+          const cached = getCircleImage(sp.img.img, d);
+          if(cached){
+            ctx.globalAlpha = 0.98*sp.a*_dim;
+            ctx.drawImage(cached, sp.x - d/2, sp.y - d/2, d, d);
+            ctx.globalAlpha = 1;
+          }
+        } else {
+          ctx.fillStyle='rgba(255,255,255,'+(0.40*_dim)+')';
+          ctx.font='700 12px Barlow, sans-serif';
+          ctx.textAlign='center'; ctx.textBaseline='middle';
+          ctx.fillText('…', sp.x, sp.y);
+        }
+
+        // family colour ring — persistent, distinct colour per family
+        if(sp.a > 0.25){
+          const _fCol = night.getFamilyColor(sp.fam);
+          ctx.beginPath(); ctx.arc(sp.x, sp.y, r*1.07, 0, Math.PI*2);
+          ctx.strokeStyle=hexToRgba(_fCol, 0.44*sp.a*_dim); ctx.lineWidth=2; ctx.stroke(); ctx.lineWidth=1;
+        }
+        // selected: brighter family ring + thin white outer ring
+        if(night.selected===sp){
+          const _fCol = night.getFamilyColor(sp.fam);
+          ctx.beginPath(); ctx.arc(sp.x, sp.y, r*1.07, 0, Math.PI*2);
+          ctx.strokeStyle=hexToRgba(_fCol, 0.92); ctx.lineWidth=3; ctx.stroke(); ctx.lineWidth=1;
+          ctx.beginPath(); ctx.arc(sp.x, sp.y, r*1.18, 0, Math.PI*2);
+          ctx.strokeStyle='rgba(255,255,255,0.68)'; ctx.lineWidth=1.5; ctx.stroke(); ctx.lineWidth=1;
+        }
+        // hover family highlight: sidebar hover lights up matching sprites
+        if(_hoverFam && sp.fam===_hoverFam && night.selected!==sp && sp.a>0.25){
+          ctx.beginPath(); ctx.arc(sp.x, sp.y, r*1.22, 0, Math.PI*2);
+          ctx.strokeStyle='rgba(255,255,255,0.72)'; ctx.lineWidth=2; ctx.stroke(); ctx.lineWidth=1;
+        }
+      }
+
+      // hover tooltip (settled sprites only)
+      {
+        const _hov = night.hitTest(ui.pointer.x, ui.pointer.y);
+        if(_hov && _hov.settled){
+          const _label = _hov.common || _hov.sci;
+          const _short = _label.length>44 ? _label.slice(0,41)+'…' : _label;
+          ctx.font='700 12px Barlow, sans-serif';
+          const _tw = ctx.measureText(_short).width;
+          const _tp=8, _tr=7;
+          const _tx = clamp(_hov.x - _tw/2 - _tp, sheet.x+6, sheet.x+sheet.w-_tw-_tp*2-6);
+          const _ty = _hov.y - 34*_hov.s - 34;
+          roundRect(_tx, _ty, _tw+_tp*2, 24, _tr);
+          ctx.fillStyle='rgba(18,8,28,0.82)'; ctx.fill();
+          ctx.strokeStyle=hexToRgba(palette.purple,0.38); ctx.lineWidth=1; ctx.stroke();
+          ctx.fillStyle='rgba(255,255,255,0.92)';
+          ctx.textAlign='left'; ctx.textBaseline='middle';
+          ctx.fillText(_short, _tx+_tp, _ty+12);
+        }
+      }
+
+      // right sidebar: family legend + selected detail
+      const sx=ar.sx, sy=ar.sy, sw=ar.sw, sh=ar.h;
+      roundRect(sx, sy, sw, sh, 22);
+      ctx.fillStyle=hexToRgba(palette.purple, 0.06); ctx.fill();
+      ctx.strokeStyle=hexToRgba(palette.purple, 0.16); ctx.lineWidth=1; ctx.stroke();
+
+      // Family legend header
+      ctx.fillStyle=hexToRgba(palette.purple, 0.88);
+      ctx.font='800 11px Barlow, sans-serif';
+      ctx.textAlign='left'; ctx.textBaseline='top';
+      const _famTitle = night.seenFamilies.length
+        ? 'FAMILIES (' + night.seenFamilies.length + ')  ·  ' + night.sprites.length + ' / ' + night.session.length + ' arrived'
+        : 'FAMILIES  ·  ' + night.sprites.length + ' / ' + night.session.length + ' arrived';
+      ctx.fillText(_famTitle, sx+12, sy+10);
+
+      let _fy = sy+26;
+
+      // handle wheel scroll over family list
+      if(ui.wheel && !night.datePicker && !night.familyPicker
+         && ui.pointer.x>=sx && ui.pointer.x<=sx+sw
+         && ui.pointer.y>=_famListTop && ui.pointer.y<_famListBottom){
+        night._famLegendScrollRow=clamp(_clampedScrollRow+Math.sign(ui.wheel), 0, Math.max(0, _sortedFams.length-_visRows));
+      }
+
+      if(_sortedFams.length===0){
+        ctx.fillStyle='rgba(255,255,255,0.30)';
+        ctx.font='500 11px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText('Families appear as arrivals land.', sx+14, _fy+2);
+        _fy += 18;
+      } else {
+        const _displayFams=_sortedFams.slice(_clampedScrollRow, _clampedScrollRow+_visRows);
+        for(let _fi=0; _fi<_displayFams.length; _fi++){
+          const _sf2=_displayFams[_fi];
+          const _isHov=_hoverFam===_sf2.fam;
+
+          roundRect(sx+12, _fy, sw-24, _famRowH, 8);
+          ctx.fillStyle=_isHov ? hexToRgba(_sf2.color, 0.18) : 'rgba(255,255,255,0.05)'; ctx.fill();
+          ctx.strokeStyle=_isHov ? hexToRgba(_sf2.color, 0.60) : 'rgba(255,255,255,0.10)'; ctx.lineWidth=1; ctx.stroke();
+
+          ctx.beginPath(); ctx.arc(sx+21, _fy+_famRowH/2, 4, 0, Math.PI*2);
+          ctx.fillStyle=_sf2.color; ctx.fill();
+
+          const _flabel=_sf2.fam.length>20 ? _sf2.fam.slice(0,18)+'…' : _sf2.fam;
+          ctx.fillStyle=_isHov ? 'rgba(255,255,255,0.98)' : 'rgba(255,255,255,0.78)';
+          ctx.font='600 11px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='middle';
+          ctx.fillText(_flabel, sx+30, _fy+_famRowH/2);
+
+          const _cntStr=String(_sf2.count);
+          ctx.font='700 10px Barlow, sans-serif';
+          const _cntW=ctx.measureText(_cntStr).width+8;
+          roundRect(sx+sw-12-_cntW, _fy+4, _cntW, _famRowH-8, 5);
+          ctx.fillStyle=hexToRgba(_sf2.color, _isHov ? 0.56 : 0.36); ctx.fill();
+          ctx.fillStyle='rgba(255,255,255,0.88)';
+          ctx.textAlign='center'; ctx.textBaseline='middle';
+          ctx.fillText(_cntStr, sx+sw-12-_cntW/2, _fy+_famRowH/2);
+
+          _fy += _famRowStep;
+        }
+        // scrollbar when there are more families than fit
+        if(_sortedFams.length>_visRows){
+          const _sbH=_visRows*_famRowStep;
+          const _thumbH=Math.max(18, _sbH*(_visRows/_sortedFams.length));
+          const _thumbTop=_famListTop+(_clampedScrollRow/Math.max(1,_sortedFams.length-_visRows))*(_sbH-_thumbH);
+          roundRect(sx+sw-8, _famListTop, 3, _sbH, 2);
+          ctx.fillStyle='rgba(255,255,255,0.08)'; ctx.fill();
+          roundRect(sx+sw-8, _thumbTop, 3, _thumbH, 2);
+          ctx.fillStyle='rgba(255,255,255,0.36)'; ctx.fill();
+        }
+      }
+
+      // Divider
+      const _divY = _fy + 5;
+      ctx.beginPath(); ctx.moveTo(sx+14,_divY); ctx.lineTo(sx+sw-14,_divY);
+      ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.lineWidth=1; ctx.stroke();
+
+      // Selected panel
+      const sel = night.selected;
+      const panelY = _divY + 8;
+      const panelH = Math.max(100, sh - (panelY-sy) - 8);
+      roundRect(sx+12, panelY, sw-24, panelH, 16);
+      ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.fill();
+      ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.stroke();
+
+      if(sel){
+        const _imgH = Math.min(150, Math.floor(panelH*0.44));
+        const imgBox={x:sx+18, y:panelY+10, w:sw-36, h:_imgH};
+        roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,10);
+        ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.fill();
+        ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.stroke();
+        if(sel.img && sel.img.ready && sel.img.ok && sel.img.img){
+          drawFitImage(imgBox, sel.img.img, 4, 10);
+        }
+
+        const _txW = sw-44;
+        let _ety = imgBox.y+imgBox.h+9;
+        ctx.textAlign='left'; ctx.textBaseline='top';
+
+        // common name — primary headline (1b)
+        if(sel.common){
+          ctx.fillStyle='rgba(255,255,255,0.95)';
+          ctx.font='900 14px Barlow, sans-serif';
+          const _cnL=wrapText(sel.common, _txW, ctx.font);
+          for(const ln of _cnL.slice(0,2)){ ctx.fillText(ln, sx+22, _ety); _ety+=17; }
+        }
+
+        // scientific name italic (smaller, dimmer)
+        ctx.fillStyle='rgba(255,255,255,0.52)';
+        ctx.font='italic 600 11px Barlow, sans-serif';
+        const _snL=wrapText(sel.sci, _txW, ctx.font);
+        for(const ln of _snL.slice(0,1)){ ctx.fillText(ln, sx+22, _ety); _ety+=14; }
+
+        _ety+=4;
+
+        // family chip
+        if(sel.fam && sel.fam!=='(no family)'){
+          const _chipFont='600 10px Barlow, sans-serif';
+          ctx.font=_chipFont;
+          const _chipTxt = sel.fam.length>24 ? sel.fam.slice(0,22)+'…' : sel.fam;
+          const _chipW = Math.min(ctx.measureText(_chipTxt).width+14, _txW);
+          roundRect(sx+22, _ety, _chipW, 18, 5);
+          ctx.fillStyle=hexToRgba(palette.purple, 0.32); ctx.fill();
+          ctx.strokeStyle=hexToRgba(palette.purple, 0.52); ctx.lineWidth=1; ctx.stroke();
+          ctx.fillStyle=hexToRgba(palette.purple, 0.98);
+          ctx.textAlign='left'; ctx.textBaseline='middle';
+          ctx.fillText(_chipTxt, sx+29, _ety+9);
+          _ety+=24;
+        }
+
+        // time observed
+        const _tObs=night.formatObservedTime(sel);
+        if(_tObs){
+          ctx.fillStyle='rgba(255,255,255,0.38)';
+          ctx.font='500 10px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          ctx.fillText(_tObs, sx+22, _ety);
+          _ety+=14;
+        }
+
+        // navigation: ← [N/total] →
+        if(night.sprites.length > 1){
+          const _nBH=26, _nBW=30, _nY=panelY+panelH-74;
+          addButton(sx+18, _nY, _nBW, _nBH, '◀', ()=>night.modalPrev(), {fontSize:12, r:7});
+          addButton(sx+sw-18-_nBW, _nY, _nBW, _nBH, '▶', ()=>night.modalNext(), {fontSize:12, r:7});
+          ctx.fillStyle='rgba(255,255,255,0.46)';
+          ctx.font='600 11px Barlow, sans-serif';
+          ctx.textAlign='center'; ctx.textBaseline='middle';
+          const _nc = night.modalIdx!=null ? (night.modalIdx+1)+' / '+night.sprites.length : '— / '+night.sprites.length;
+          ctx.fillText(_nc, sx+sw/2, _nY+_nBH/2);
+        }
+
+        addButton(sx+18, panelY+panelH-44, sw-36, 34, 'Open observation', ()=>{
+          const u=sel.recordUrl||sel.url;
+          if(u){ try{ window.open(u,'_blank'); }catch(_){} }
+          else toast('No URL column found.', 'warn', 1500);
+        }, {fontSize:12, r:9, primary:true});
+      } else {
+        ctx.fillStyle='rgba(255,255,255,0.38)';
+        ctx.font='500 12px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText('Tap an arrival to explore.', sx+20, panelY+14);
+      }
+
+      // picker overlays drawn last so they render on top of sprites and sidebar
+      if(night.datePicker){
+        const list = data.nightDates;
+        drawScrollPicker({
+          list,
+          modalW:      clamp(W * 0.36, 300, 440),
+          scrollOwner: night, scrollKey: '_dateScrollPx',
+          onClose:     ()=>{ night.datePicker=false; },
+          title:       'Pick a Date',
+          countLabel:  list.length + ' dates',
+          accent:      palette.purple,
+          isCurrent:   (d, idx) => idx === night.dateIndex,
+          getLabel:    (d)      => d,
+          getCount:    (d)      => ((data.nightMap && data.nightMap[d]) ? data.nightMap[d].length : 0) + ' rec',
+          onSelect:    (d, idx) => night.setDateIndex(idx)
+        });
+      }
+      if(night.familyPicker && data.keys.family){
+        const fams = ['All'].concat(night.familiesForDate(night.currentDate()));
+        drawScrollPicker({
+          list:        fams,
+          modalW:      clamp(W * 0.36, 300, 440),
+          scrollOwner: night, scrollKey: '_famScrollPx',
+          onClose:     ()=>{ night.familyPicker=false; },
+          title:       'Filter by Family',
+          countLabel:  fams.length + ' families',
+          accent:      palette.purple,
+          isCurrent:   (f) => (night.familyFilter==='All' && f==='All') || night.familyFilter===f,
+          getLabel:    (f) => f === 'All' ? 'All families' : f,
+          getCount:    null,
+          onSelect:    (f) => night.setFamilyFilter(f==='All'?'All':f)
+        });
+      }
+    }
+
+
+
+    // ---------- Main loop ----------
+    let lastT=performance.now();
+    function frame(t){
+      const rawDt=Math.min(0.033, (t-lastT)/1000);
+      lastT=t;
+
+      // auto-return to home after 5 min idle (kiosk/exhibition mode)
+      if(scene!=='home' && t - lastInteraction > IDLE_MS){
+        goto('home');
+        lastInteraction = t;
+      }
+
+      if(scene==='home') drawHome(rawDt);
+      else if(scene==='quiz') drawQuiz(rawDt);
+      else if(scene==='match') drawMatch(rawDt);
+      else if(scene==='invaders') drawInvaders(rawDt);
+      else if(scene==='snake') drawSnake(rawDt);
+      else if(scene==='night') drawNight(rawDt);
+      else drawHome(rawDt);
+
+      // Help overlay (clears buttons when active, draws its own)
+      if(showHelp && scene !== 'home'){
+        clearButtons();
+        drawHelpModal();
+      }
+
+      for(const b of ui.buttons) drawButton(b);
+
+      if(ui.pointer.clicked){
+        const px=ui.pointer.x, py=ui.pointer.y;
+        for(let i=ui.buttons.length-1;i>=0;i--){
+          const b=ui.buttons[i];
+          if(hitBtn(b,px,py)){
+            try{ b.fn(); }catch(err){ toast('Action failed: '+safeStr(err), 'warn', 2200); }
+            break;
+          }
+        }
+        ui.pointer.clicked=false;
+      }
+
+      ui.wheel = 0;
+      drawToasts();
+      requestAnimationFrame(frame);
+    }
+
+    // ---------- Boot ----------
+    tts.init();
+    toast('Ready — drop your iNaturalist CSV to begin.', 'info', 3000);
+    requestAnimationFrame(frame);
+
+  } catch(e) {
+    showError(e);
+  }
+})();
+</script>
+</body>
+</html>
