@@ -19,10 +19,44 @@
     }
     #fallback h1{font-size:18px;margin:0 0 10px 0}
     #fallback code{white-space:pre-wrap; color: rgba(200,255,220,0.92)}
+    #inatOverlay { position:fixed; inset:0; background:rgba(0,0,0,0.72); z-index:100; display:flex; align-items:center; justify-content:center; }
+    #inatPanel { background:#07090f; border:1px solid rgba(0,165,97,0.35); border-radius:20px; padding:28px 32px; width:min(440px,calc(100vw - 40px)); font-family:Barlow,sans-serif; color:rgba(255,255,255,0.92); }
+    #inatPanel h2 { margin:0 0 18px 0; font-size:18px; font-weight:800; color:#00a561; }
+    .inat-tabs { display:flex; gap:8px; margin-bottom:16px; }
+    .inat-tab { padding:7px 18px; border-radius:999px; border:1px solid rgba(255,255,255,0.18); background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.65); cursor:pointer; font:600 14px Barlow,sans-serif; }
+    .inat-tab.active { background:rgba(0,165,97,0.18); border-color:rgba(0,165,97,0.5); color:#00a561; }
+    #inatInput { width:100%; box-sizing:border-box; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.18); border-radius:12px; padding:11px 14px; font:400 15px Barlow,sans-serif; color:rgba(255,255,255,0.92); outline:none; }
+    #inatInput:focus { border-color:rgba(0,165,97,0.5); }
+    #inatInput::placeholder { color:rgba(255,255,255,0.30); }
+    #inatHint { margin:8px 0 0 2px; font-size:12px; color:rgba(255,255,255,0.38); }
+    #inatProgress { margin-top:10px; font-size:13px; color:#00a561; min-height:18px; }
+    .inat-actions { display:flex; gap:10px; margin-top:20px; justify-content:flex-end; }
+    .inat-btn { padding:10px 22px; border-radius:12px; border:none; cursor:pointer; font:600 14px Barlow,sans-serif; }
+    .inat-btn-cancel { background:rgba(255,255,255,0.08); color:rgba(255,255,255,0.65); }
+    .inat-btn-cancel:hover { background:rgba(255,255,255,0.14); }
+    .inat-btn-load { background:rgba(0,165,97,0.85); color:#fff; }
+    .inat-btn-load:hover:not(:disabled) { background:#00a561; }
+    .inat-btn:disabled { opacity:0.5; cursor:not-allowed; }
   </style>
 </head>
 <body>
   <input id="fileInput" type="file" accept=".csv,text/csv"/>
+  <div id="inatOverlay" style="display:none">
+    <div id="inatPanel">
+      <h2>Load from iNaturalist</h2>
+      <div class="inat-tabs">
+        <button class="inat-tab active" id="inatTabUser">User</button>
+        <button class="inat-tab" id="inatTabProject">Project</button>
+      </div>
+      <input id="inatInput" type="text" placeholder="Enter iNaturalist username…" autocomplete="off" spellcheck="false"/>
+      <p id="inatHint">Fetches all research-grade observations with photos</p>
+      <div id="inatProgress"></div>
+      <div class="inat-actions">
+        <button class="inat-btn inat-btn-cancel" id="inatCancelBtn">Cancel</button>
+        <button class="inat-btn inat-btn-load" id="inatLoadBtn">Load Observations</button>
+      </div>
+    </div>
+  </div>
   <canvas id="c"></canvas>
 
   <div id="fallback">
@@ -782,6 +816,180 @@ function bumpDay(){
         }
       };
       reader.readAsText(file);
+    }
+
+    // ---------- iNaturalist API loader ----------
+    const inatState = { type: 'user', loading: false };
+
+    function showINatModal(){
+      document.getElementById('inatOverlay').style.display = 'flex';
+      document.getElementById('inatProgress').textContent = '';
+      document.getElementById('inatLoadBtn').disabled = false;
+      const inp = document.getElementById('inatInput');
+      inp.value = '';
+      setTimeout(()=> inp.focus(), 50);
+    }
+
+    function hideINatModal(){
+      document.getElementById('inatOverlay').style.display = 'none';
+      inatState.loading = false;
+    }
+
+    async function loadFromINat(type, value){
+      const progressEl = document.getElementById('inatProgress');
+      const loadBtn    = document.getElementById('inatLoadBtn');
+      const val = safeStr(value).trim();
+      if(!val) return;
+      inatState.loading = true;
+      loadBtn.disabled = true;
+
+      function setProgress(msg){ progressEl.textContent = msg; }
+
+      try {
+        const BASE      = 'https://api.inaturalist.org/v1/observations';
+        const PAGE_SIZE = 200;
+        const MAX_PAGE  = 100;
+        const PARALLEL  = 5;
+
+        const param = (type === 'user')
+          ? ((/^\d+$/).test(val) ? 'user_id=' : 'user_login=') + encodeURIComponent(val)
+          : 'project_id=' + encodeURIComponent(val);
+        const baseParams = param + '&per_page=' + PAGE_SIZE + '&photos=true&quality_grade=research&order_by=observed_on&order=desc';
+        function buildUrl(page){ return BASE + '?' + baseParams + '&page=' + page; }
+
+        setProgress('Connecting to iNaturalist…');
+        const firstResp = await fetch(buildUrl(1));
+        if(!firstResp.ok){
+          const body = await firstResp.text().catch(()=>'');
+          throw new Error('iNaturalist API ' + firstResp.status + (body ? ': ' + body.slice(0, 120) : ''));
+        }
+        const firstJson    = await firstResp.json();
+        const totalResults = firstJson.total_results || 0;
+        const totalPages   = Math.min(MAX_PAGE, Math.ceil(totalResults / PAGE_SIZE));
+        let allObs = (firstJson.results || []).slice();
+        setProgress('Fetching ' + allObs.length + ' / ' + totalResults + ' observations…');
+
+        for(let p = 2; p <= totalPages; p += PARALLEL){
+          const batch = [];
+          for(let i = p; i < p + PARALLEL && i <= totalPages; i++) batch.push(i);
+          const batchResults = await Promise.all(
+            batch.map(pg => fetch(buildUrl(pg))
+              .then(r => r.ok ? r.json() : {results:[]})
+              .catch(()=>({results:[]})))
+          );
+          for(const json of batchResults) allObs = allObs.concat(json.results || []);
+          setProgress('Fetching ' + allObs.length + ' / ' + totalResults + ' observations…');
+        }
+
+        if(!allObs.length){
+          toast('No research-grade observations with photos found.', 'warn', 4000);
+          hideINatModal();
+          return;
+        }
+
+        setProgress('Looking up taxonomy (' + allObs.length + ' obs)…');
+        const ancestorIdSet = new Set();
+        for(const obs of allObs){
+          for(const aid of (obs.taxon && obs.taxon.ancestor_ids ? obs.taxon.ancestor_ids : [])) ancestorIdSet.add(aid);
+        }
+
+        const ancestorMap  = new Map();
+        const ancestorIds  = Array.from(ancestorIdSet);
+        const TAXA_BATCH   = 200;
+        const taxaBatches  = [];
+        for(let i = 0; i < ancestorIds.length; i += TAXA_BATCH) taxaBatches.push(ancestorIds.slice(i, i + TAXA_BATCH));
+
+        for(let b = 0; b < taxaBatches.length; b += PARALLEL){
+          const chunk = taxaBatches.slice(b, b + PARALLEL);
+          const results = await Promise.all(chunk.map(ids =>
+            fetch('https://api.inaturalist.org/v1/taxa?id=' + ids.join(',') + '&per_page=' + TAXA_BATCH)
+              .then(r => r.ok ? r.json() : {results:[]})
+              .catch(()=>({results:[]}))
+          ));
+          for(const tj of results){
+            for(const t of (tj.results || [])) ancestorMap.set(t.id, {name: t.name || '', rank: t.rank || ''});
+          }
+          setProgress('Loading taxonomy… ' + Math.min(b + PARALLEL, taxaBatches.length) + ' / ' + taxaBatches.length + ' batches');
+        }
+
+        const HEADERS = ['scientific_name','taxon_family_name','taxon_order_name','common_name','image_url','observed_on','url'];
+        const inatColMap = {};
+        HEADERS.forEach((h, i) => { inatColMap[h] = i; });
+
+        const rows = [];
+        for(const obs of allObs){
+          const taxon = obs.taxon;
+          if(!taxon || !taxon.name) continue;
+
+          let imageUrl = '';
+          if(obs.photos && obs.photos.length > 0){
+            imageUrl = safeStr(obs.photos[0].url || '').replace('/square.', '/medium.');
+          } else if(taxon.default_photo && taxon.default_photo.medium_url){
+            imageUrl = safeStr(taxon.default_photo.medium_url);
+          }
+          if(!imageUrl) continue;
+
+          let family = '', order = '';
+          for(const aid of (taxon.ancestor_ids || [])){
+            const a = ancestorMap.get(aid);
+            if(!a) continue;
+            if(a.rank === 'family' && !family) family = a.name;
+            if(a.rank === 'order'  && !order)  order  = a.name;
+          }
+          if(!family && taxon.rank === 'family') family = safeStr(taxon.name);
+          if(!order  && taxon.rank === 'order')  order  = safeStr(taxon.name);
+
+          rows.push([
+            safeStr(taxon.name),
+            family,
+            order,
+            safeStr(taxon.preferred_common_name || ''),
+            imageUrl,
+            safeStr(obs.observed_on || ''),
+            safeStr(obs.uri || '')
+          ]);
+        }
+
+        if(!rows.length){
+          toast('No usable observations found (need photo + scientific name).', 'warn', 4000);
+          hideINatModal();
+          return;
+        }
+
+        data.headers = HEADERS;
+        data.colMap  = inatColMap;
+        data.rows    = rows;
+        data.badImage.clear();
+        imgCache.clear();
+        circleCache.clear();
+
+        detectKeys();
+        buildIndexes();
+        buildNightIndex();
+
+        const label = (type === 'user' ? 'iNat user: ' : 'iNat project: ') + val;
+        state.csv.loaded   = true;
+        state.csv.filename = label;
+        state.csv.rows     = rows.length;
+        saveState();
+
+        quiz.newQuestion();
+        match.reset(true);
+        invaders.reset(true);
+        snake.reset(true);
+        night.reset(true);
+
+        const truncNote = totalResults > allObs.length ? ' (capped at ' + allObs.length + ' of ' + totalResults + ')' : '';
+        toast('Loaded ' + rows.length + ' observations from iNaturalist.' + truncNote, 'ok', 3200);
+        hideINatModal();
+        goto('home');
+
+      } catch(err){
+        toast('iNaturalist load failed: ' + safeStr(err), 'warn', 7000);
+        setProgress('Error: ' + safeStr(err).slice(0, 100));
+        loadBtn.disabled  = false;
+        inatState.loading = false;
+      }
     }
 
     // ---------- Clean night sky background ----------
@@ -2622,22 +2830,24 @@ const invaders = {
       ctx.font='400 14px Barlow, sans-serif';
       ctx.fillText('Interactive study from your iNaturalist observations', pad, pad+62);
 
-      // Fullscreen toggle — sits to the left of the Load CSV button
+      // Top-right buttons: fullscreen | CSV | iNaturalist
       const _fsLbl = document.fullscreenElement ? '⊟' : '⊞';
-      addButton(W-pad-192, pad+10, 44, 38, _fsLbl, ()=>toggleFullscreen(), {fontSize:17, r:10});
+      addButton(W-pad-38,         pad+10, 38,  38, _fsLbl,       ()=>toggleFullscreen(), {fontSize:17, r:10});
+      addButton(W-pad-38-8-100,   pad+10, 100, 38, 'Load CSV',   ()=>fileInput.click(),  {fontSize:14, r:10});
+      addButton(W-pad-38-8-100-8-160, pad+10, 160, 38, 'Load iNat', ()=>showINatModal(), {fontSize:14, r:10, accent:palette.green});
 
       // Instruction text
       ctx.fillStyle='rgba(255,255,255,0.35)';
       ctx.font='400 13px Barlow, sans-serif';
-      ctx.fillText('Drop your CSV anywhere to begin  •  Press ? for shortcuts', pad, pad+86);
+      ctx.fillText('Load from iNaturalist above  •  or drag-drop a CSV  •  Press ? for shortcuts', pad, pad+86);
 
       // Menu cards
       const cards = [
-        { label:'Quiz',              sub:'Multiple choice identification', icon:'?', color:palette.green,  fn:()=>{ if(!state.csv.loaded) toast('Load a CSV first.','warn',2200); else { quiz.newQuestion(); goto('quiz'); } }},
-        { label:'Sorting Table',     sub:'Drag labels to match specimens', icon:'⇅', color:palette.blue,   fn:()=>{ if(!state.csv.loaded) toast('Load a CSV first.','warn',2200); else { match.reset(true); goto('match'); } }},
-        { label:'Night Walk',        sub:'Browse observations by date',    icon:'☽', color:palette.purple, fn:()=>{ if(!state.csv.loaded) return toast('Load a CSV first.','warn',2200); if(!data.nightDates.length) return toast('No date column found.','warn',3000); const d=bumpDay(); state.day[d].night++; state.lifetime.night.visits++; saveState(); night.reset(true); goto('night'); }},
-        { label:'Sheet Invaders',    sub:'Arcade shooter with your data',  icon:'▼', color:palette.red,    fn:()=>{ if(!state.csv.loaded) toast('Load a CSV first.','warn',2200); else { invaders.reset(true); goto('invaders'); } }},
-        { label:'Specimen Snake',    sub:'Collect specimens, grow longer', icon:'~', color:palette.orange,  fn:()=>{ if(!state.csv.loaded) toast('Load a CSV first.','warn',2200); else { snake.reset(true); goto('snake'); } }},
+        { label:'Quiz',              sub:'Multiple choice identification', icon:'?', color:palette.green,  fn:()=>{ if(!state.csv.loaded) toast('Load data first — use Load iNat or drag-drop a CSV.','warn',2800); else { quiz.newQuestion(); goto('quiz'); } }},
+        { label:'Sorting Table',     sub:'Drag labels to match specimens', icon:'⇅', color:palette.blue,   fn:()=>{ if(!state.csv.loaded) toast('Load data first — use Load iNat or drag-drop a CSV.','warn',2800); else { match.reset(true); goto('match'); } }},
+        { label:'Night Walk',        sub:'Browse observations by date',    icon:'☽', color:palette.purple, fn:()=>{ if(!state.csv.loaded) return toast('Load data first — use Load iNat or drag-drop a CSV.','warn',2800); if(!data.nightDates.length) return toast('No date column found.','warn',3000); const d=bumpDay(); state.day[d].night++; state.lifetime.night.visits++; saveState(); night.reset(true); goto('night'); }},
+        { label:'Sheet Invaders',    sub:'Arcade shooter with your data',  icon:'▼', color:palette.red,    fn:()=>{ if(!state.csv.loaded) toast('Load data first — use Load iNat or drag-drop a CSV.','warn',2800); else { invaders.reset(true); goto('invaders'); } }},
+        { label:'Specimen Snake',    sub:'Collect specimens, grow longer', icon:'~', color:palette.orange,  fn:()=>{ if(!state.csv.loaded) toast('Load data first — use Load iNat or drag-drop a CSV.','warn',2800); else { snake.reset(true); goto('snake'); } }},
       ];
 
       const startY = pad + 116;
@@ -2695,11 +2905,9 @@ const invaders = {
         ctx.fillStyle='rgba(255,255,255,0.25)';
         ctx.font='500 12px Barlow, sans-serif';
         ctx.textAlign='left'; ctx.textBaseline='bottom';
-        ctx.fillText('○ No CSV loaded — drag and drop to begin', pad, statusY);
+        ctx.fillText('○ No data loaded — use Load iNat or drag-drop a CSV to begin', pad, statusY);
       }
 
-      // Load CSV button
-      addButton(W - pad - 140, pad + 10, 140, 38, 'Load CSV', ()=>fileInput.click(), {fontSize:14, r:10, accent:palette.green});
     }
 
     function drawQuiz(dt){
@@ -4053,7 +4261,46 @@ if(invaders.grid){
 
     // ---------- Boot ----------
     tts.init();
-    toast('Ready — drop your iNaturalist CSV to begin.', 'info', 3000);
+
+    // Wire up iNaturalist modal
+    (function(){
+      const overlay  = document.getElementById('inatOverlay');
+      const input    = document.getElementById('inatInput');
+      const hint     = document.getElementById('inatHint');
+      const loadBtn  = document.getElementById('inatLoadBtn');
+      const cancelBtn= document.getElementById('inatCancelBtn');
+      const tabUser  = document.getElementById('inatTabUser');
+      const tabProj  = document.getElementById('inatTabProject');
+
+      function setTab(type){
+        inatState.type = type;
+        tabUser.classList.toggle('active', type === 'user');
+        tabProj.classList.toggle('active', type === 'project');
+        input.placeholder = type === 'user'
+          ? 'Enter iNaturalist username…'
+          : 'Enter project slug or numeric ID…';
+        hint.textContent = type === 'user'
+          ? 'Fetches all research-grade observations with photos'
+          : 'Fetches research-grade observations from a public project';
+      }
+
+      tabUser.addEventListener('click',  ()=> setTab('user'));
+      tabProj.addEventListener('click',  ()=> setTab('project'));
+      cancelBtn.addEventListener('click', hideINatModal);
+      overlay.addEventListener('click', (e)=>{ if(e.target === overlay) hideINatModal(); });
+      input.addEventListener('keydown', (e)=>{
+        if(e.key === 'Enter'){ e.preventDefault(); if(!loadBtn.disabled) loadBtn.click(); }
+        if(e.key === 'Escape') hideINatModal();
+      });
+      loadBtn.addEventListener('click', ()=>{
+        if(inatState.loading) return;
+        const val = input.value.trim();
+        if(!val){ input.focus(); return; }
+        loadFromINat(inatState.type, val);
+      });
+    })();
+
+    toast('Ready — click Load iNat or drop a CSV to begin.', 'info', 3000);
     requestAnimationFrame(frame);
 
   } catch(e) {
