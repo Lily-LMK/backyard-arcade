@@ -404,7 +404,7 @@
       keysDown.add(e.key);
       touchInteraction();
 
-      if(e.key==='Escape'){ if(showHelp){ showHelp=false; } else if(scene==='night'&&night.selected){ night.closeModal(); } else goto('home'); }
+      if(e.key==='Escape'){ if(showHelp){ showHelp=false; } else if(scene==='night'&&night.card){ night.closeModal(); } else goto('home'); }
       if(e.key==='p' || e.key==='P'){ paused = !paused; toast(paused?'Paused':'Resumed','info',900); }
       if(e.key==='?' || e.key==='/'){ showHelp = !showHelp; }
       if(e.key==='f' || e.key==='F'){ toggleFullscreen(); }
@@ -418,9 +418,9 @@
       if(scene==='quiz' && (e.key==='n' || e.key==='N')) quiz.newQuestion();
       if(scene==='quiz' && (e.key==='m' || e.key==='M')) quiz.toggleMode();
 
-      if(scene==='night' && (e.key==='ArrowLeft')){ if(night.selected) night.modalPrev(); else night.prevDate(); }
-      if(scene==='night' && (e.key==='ArrowRight')){ if(night.selected) night.modalNext(); else night.nextDate(); }
-      if(scene==='night' && (e.key===' ') && !night.selected) night.toggleAuto();
+      if(scene==='night' && (e.key==='ArrowLeft')){ if(night.card) night.modalPrev(); else night.prevDate(); }
+      if(scene==='night' && (e.key==='ArrowRight')){ if(night.card) night.modalNext(); else night.nextDate(); }
+      if(scene==='night' && (e.key===' ') && !night.card) night.toggleAuto();
     }, {passive:false});
     window.addEventListener('keyup', (e)=> keysDown.delete(e.key), {passive:true});
 
@@ -533,6 +533,7 @@ function bumpDay(){
       keys:{ common:null, date:null, time:null, url:null },
       nightMap:null,   // {date: [rowIdx,...]}
       nightDates:[],   // sorted
+      sciRecords:new Map(), // scientific_name -> [rowIdx,...] across the whole set
     };
 
     function parseCSV(text){
@@ -639,6 +640,7 @@ function bumpDay(){
     function buildIndexes(){
       data.idx.any=[]; data.idx.sci=[]; data.idx.fam=[];
       data.orders=[]; data.idxByOrder={}; data.uniquesByOrder={};
+      data.sciRecords=new Map();
 
       const sciSet=new Set(), famSet=new Set();
       const orderSet=new Set();
@@ -649,6 +651,16 @@ function bumpDay(){
 
       for(let r=0;r<data.rows.length;r++){
         const row=data.rows[r];
+
+        // Count every record of each species across the WHOLE set (independent
+        // of whether it has a photo) so the card can show "#N of M records".
+        const sciAll=getCol(row,'scientific_name').trim();
+        if(sciAll){
+          let arr=data.sciRecords.get(sciAll);
+          if(!arr){ arr=[]; data.sciRecords.set(sciAll, arr); }
+          arr.push(r);
+        }
+
         const url=getCol(row,'image_url').trim();
         if(!url) continue;
 
@@ -776,6 +788,51 @@ function bumpDay(){
         imgCache.delete(firstKey);
       }
       return rec;
+    }
+
+    // Rewrite an iNaturalist photo URL to a different size token
+    // (square 75 · small 240 · medium 500 · large 1024 · original).
+    // Lets us fetch tiny thumbnails for the flying sprites and only pull
+    // a larger image when a specimen card is actually opened.
+    function inatPhotoSize(url, size){
+      const u = safeStr(url).trim();
+      if(!u) return u;
+      return u.replace(/\/(square|small|medium|large|original)(\.[a-z0-9]+)(\?.*)?$/i, '/'+size+'$2$3');
+    }
+
+    // Full taxonomic rank chain, coarse → fine. getTaxonomy returns only
+    // the ranks actually present (column exists and value non-empty).
+    const TAXON_RANKS = [
+      ['taxon_kingdom_name','Kingdom'],
+      ['taxon_phylum_name','Phylum'],
+      ['taxon_subphylum_name','Subphylum'],
+      ['taxon_superclass_name','Superclass'],
+      ['taxon_class_name','Class'],
+      ['taxon_subclass_name','Subclass'],
+      ['taxon_superorder_name','Superorder'],
+      ['taxon_order_name','Order'],
+      ['taxon_suborder_name','Suborder'],
+      ['taxon_superfamily_name','Superfamily'],
+      ['taxon_family_name','Family'],
+      ['taxon_subfamily_name','Subfamily'],
+      ['taxon_supertribe_name','Supertribe'],
+      ['taxon_tribe_name','Tribe'],
+      ['taxon_subtribe_name','Subtribe'],
+      ['taxon_genus_name','Genus'],
+      ['taxon_subgenus_name','Subgenus'],
+      ['taxon_species_name','Species'],
+      ['taxon_subspecies_name','Subspecies'],
+    ];
+    function getTaxonomy(rowIdx){
+      if(rowIdx==null || !data.rows[rowIdx]) return [];
+      const row=data.rows[rowIdx];
+      const out=[];
+      for(const [col,label] of TAXON_RANKS){
+        if(data.colMap[col]==null) continue;
+        const v=getCol(row,col).trim();
+        if(v) out.push({rank:label, name:v, col});
+      }
+      return out;
     }
 
     // ---------- File input ----------
@@ -925,7 +982,16 @@ function bumpDay(){
           setProgress('Loading taxonomy… ' + Math.min(b + PARALLEL, taxaBatches.length) + ' / ' + taxaBatches.length + ' batches');
         }
 
-        const HEADERS = ['scientific_name','taxon_family_name','taxon_order_name','common_name','image_url','observed_on','url'];
+        // iNat rank → our column name, so API loads get the same rich taxonomy as CSV.
+        const RANK_COL = {
+          kingdom:'taxon_kingdom_name', phylum:'taxon_phylum_name', subphylum:'taxon_subphylum_name',
+          class:'taxon_class_name', subclass:'taxon_subclass_name', superorder:'taxon_superorder_name',
+          order:'taxon_order_name', suborder:'taxon_suborder_name', superfamily:'taxon_superfamily_name',
+          family:'taxon_family_name', subfamily:'taxon_subfamily_name', supertribe:'taxon_supertribe_name',
+          tribe:'taxon_tribe_name', subtribe:'taxon_subtribe_name', genus:'taxon_genus_name'
+        };
+        const RANK_COLS = Object.values(RANK_COL);
+        const HEADERS = ['scientific_name','common_name','image_url','observed_on','url'].concat(RANK_COLS);
         const inatColMap = {};
         HEADERS.forEach((h, i) => { inatColMap[h] = i; });
 
@@ -942,25 +1008,25 @@ function bumpDay(){
           }
           if(!imageUrl) continue;
 
-          let family = '', order = '';
+          const ranks = {};
           for(const aid of (taxon.ancestor_ids || [])){
             const a = ancestorMap.get(aid);
-            if(!a) continue;
-            if(a.rank === 'family' && !family) family = a.name;
-            if(a.rank === 'order'  && !order)  order  = a.name;
+            if(!a || !a.rank) continue;
+            const col = RANK_COL[a.rank];
+            if(col && !ranks[col]) ranks[col] = a.name;
           }
-          if(!family && taxon.rank === 'family') family = safeStr(taxon.name);
-          if(!order  && taxon.rank === 'order')  order  = safeStr(taxon.name);
+          // the observed taxon itself may BE one of these ranks
+          if(taxon.rank && RANK_COL[taxon.rank] && !ranks[RANK_COL[taxon.rank]]) ranks[RANK_COL[taxon.rank]] = safeStr(taxon.name);
 
-          rows.push([
+          const row = [
             safeStr(taxon.name),
-            family,
-            order,
             safeStr(taxon.preferred_common_name || ''),
             imageUrl,
             safeStr(obs.observed_on || ''),
             safeStr(obs.uri || '')
-          ]);
+          ];
+          for(const col of RANK_COLS) row.push(ranks[col] || '');
+          rows.push(row);
         }
 
         if(!rows.length){
@@ -2471,8 +2537,12 @@ const invaders = {
       familyScroll:0,
       session:[],    // row indices
       sprites:[],    // arrivals on sheet
-      selected:null, // sprite
-      modalIdx:null,       // index in sprites[] for sidebar navigation
+      selected:null, // sprite currently highlighted on the sheet (may be null)
+      card:null,     // {idx,sci,common,fam,recordUrl,url,img} shown in detail panel
+      cardList:[],   // row indices the prev/next arrows walk through
+      cardPos:-1,    // position within cardList
+      browseFam:null,// family being browsed (set by clicking a family in the legend)
+      modalIdx:null,       // legacy; kept for compatibility
       seenFamilies:[],     // [{fam, count, color}] built as sprites settle
       _famLegendScrollRow: 0,
       familyColorPalette:['#b14c9b','#46c2d2','#f7941d','#00a561','#f95caf','#7bb3ff','#ffcc44','#a8e06d'],
@@ -2485,6 +2555,7 @@ const invaders = {
         this.session=[];
         this.sprites=[];
         this.selected=null;
+        this.card=null; this.cardList=[]; this.cardPos=-1; this.browseFam=null;
         this.modalIdx=null;
         this.seenFamilies=[];
         this._famLegendScrollRow=0;
@@ -2551,6 +2622,7 @@ const invaders = {
       loadDate(dateStr){
         this.sprites=[];
         this.selected=null;
+        this.card=null; this.cardList=[]; this.cardPos=-1; this.browseFam=null;
         this.modalIdx=null;
         this.seenFamilies=[];
         this._famLegendScrollRow=0;
@@ -2625,7 +2697,7 @@ const invaders = {
 
         this.sprites.push({
           idx:ridx, url, sci, fam, common, recordUrl,
-          img:loadImage(url),
+          img:loadImage(inatPhotoSize(url, 'small')),
           // flight path (quadratic bezier): start -> control -> target
           x:startX, y:startY,
           sx:startX, sy:startY,
@@ -2691,7 +2763,7 @@ const invaders = {
         return null;
       },
       swarm(){
-        this.selected=null; this.modalIdx=null;
+        this.selected=null; this.card=null; this.cardList=[]; this.cardPos=-1; this.browseFam=null; this.modalIdx=null;
         const _p=Math.max(18, Math.min(44, W*0.05));
         const _ar=gameAreaRect(_p);
         const _sh={x:_ar.x+22, y:_ar.y+22, w:_ar.w-44, h:_ar.h-44};
@@ -2760,22 +2832,66 @@ const invaders = {
         const sf=this.seenFamilies.find(f=>f.fam===fam);
         return sf ? sf.color : this.familyColorPalette[0];
       },
-      openModal(sp){
-        const i=this.sprites.indexOf(sp);
-        if(i>=0) this.modalIdx=i;
+      // Build a detail-card record from a dataset row index. Loads the larger
+      // (medium) image lazily — only specimens you actually open pull it.
+      makeCard(idx){
+        const row=data.rows[idx];
+        if(!row) return null;
+        const url=getCol(row,'image_url').trim();
+        return {
+          idx,
+          sci:getCol(row,'scientific_name').trim(),
+          common:getCommonName(row),
+          fam:(getCol(row,'taxon_family_name').trim() || '(no family)'),
+          recordUrl:getRecordUrl(row),
+          url,
+          img:loadImage(inatPhotoSize(url, 'medium'))
+        };
       },
-      closeModal(){ this.selected=null; this.modalIdx=null; },
+      // Show a card for a row index and sync the on-sheet selection highlight.
+      showCard(idx){
+        this.card=this.makeCard(idx);
+        this.selected=this.sprites.find(s=>s.idx===idx) || null;
+      },
+      // Tap a sprite: browse all arrivals (clears any family-browse context).
+      openModal(sp){
+        this.browseFam=null;
+        this.cardList=this.sprites.map(s=>s.idx);
+        this.cardPos=this.sprites.indexOf(sp);
+        this.showCard(sp.idx);
+      },
+      // Click a family in the legend: browse just that family's members for the
+      // current night (all session rows, in arrival order).
+      selectFamily(fam){
+        const fk=data.keys.family;
+        const list=this.session.filter(idx=>{
+          const f=(getCol(data.rows[idx], fk).trim() || '(no family)');
+          return f===fam;
+        });
+        if(!list.length) return;
+        this.browseFam=fam;
+        this.cardList=list;
+        this.cardPos=0;
+        this.showCard(list[0]);
+      },
+      closeModal(){ this.selected=null; this.card=null; this.cardList=[]; this.cardPos=-1; this.browseFam=null; },
       modalNext(){
-        if(!this.sprites.length) return;
-        const cur=this.modalIdx??0;
-        this.modalIdx=(cur+1)%this.sprites.length;
-        this.selected=this.sprites[this.modalIdx];
+        if(!this.cardList.length) return;
+        this.cardPos=(this.cardPos+1)%this.cardList.length;
+        this.showCard(this.cardList[this.cardPos]);
       },
       modalPrev(){
-        if(!this.sprites.length) return;
-        const cur=this.modalIdx??0;
-        this.modalIdx=(cur-1+this.sprites.length)%this.sprites.length;
-        this.selected=this.sprites[this.modalIdx];
+        if(!this.cardList.length) return;
+        this.cardPos=(this.cardPos-1+this.cardList.length)%this.cardList.length;
+        this.showCard(this.cardList[this.cardPos]);
+      },
+      // "#N of M records" for a species across the whole dataset.
+      speciesRecord(card){
+        if(!card || !card.sci) return null;
+        const recs=data.sciRecords.get(card.sci);
+        if(!recs || !recs.length) return null;
+        const pos=recs.indexOf(card.idx);
+        return {pos:(pos>=0?pos+1:1), total:recs.length};
       },
       formatObservedTime(sp){
         const tk=data.keys.time;
@@ -2830,7 +2946,6 @@ const invaders = {
       if(scene==='night'){
         const sp = night.hitTest(ui.pointer.x, ui.pointer.y);
         if(sp){
-          night.selected=sp;
           night.openModal(sp);
           return;
         }
@@ -4280,7 +4395,7 @@ if(invaders.grid){
         }
       }
 
-      const sel = night.selected;
+      const sel = night.card;
 
       if(ar.sw > 0){
       // right sidebar: family legend + selected detail
@@ -4318,17 +4433,19 @@ if(invaders.grid){
         for(let _fi=0; _fi<_displayFams.length; _fi++){
           const _sf2=_displayFams[_fi];
           const _isHov=_hoverFam===_sf2.fam;
+          const _isActive=night.browseFam===_sf2.fam;
+          const _lit=_isHov||_isActive;
 
           roundRect(sx+12, _fy, sw-24, _famRowH, 8);
-          ctx.fillStyle=_isHov ? hexToRgba(_sf2.color, 0.18) : 'rgba(255,255,255,0.05)'; ctx.fill();
-          ctx.strokeStyle=_isHov ? hexToRgba(_sf2.color, 0.60) : 'rgba(255,255,255,0.10)'; ctx.lineWidth=1; ctx.stroke();
+          ctx.fillStyle=_isActive ? hexToRgba(_sf2.color, 0.28) : (_isHov ? hexToRgba(_sf2.color, 0.18) : 'rgba(255,255,255,0.05)'); ctx.fill();
+          ctx.strokeStyle=_lit ? hexToRgba(_sf2.color, _isActive?0.85:0.60) : 'rgba(255,255,255,0.10)'; ctx.lineWidth=_isActive?1.5:1; ctx.stroke(); ctx.lineWidth=1;
 
           ctx.beginPath(); ctx.arc(sx+21, _fy+_famRowH/2, 4, 0, Math.PI*2);
           ctx.fillStyle=_sf2.color; ctx.fill();
 
           const _flabel=_sf2.fam.length>20 ? _sf2.fam.slice(0,18)+'…' : _sf2.fam;
-          ctx.fillStyle=_isHov ? 'rgba(255,255,255,0.98)' : 'rgba(255,255,255,0.78)';
-          ctx.font='600 11px Barlow, sans-serif';
+          ctx.fillStyle=_lit ? 'rgba(255,255,255,0.98)' : 'rgba(255,255,255,0.78)';
+          ctx.font=(_isActive?'700 ':'600 ')+'11px Barlow, sans-serif';
           ctx.textAlign='left'; ctx.textBaseline='middle';
           ctx.fillText(_flabel, sx+30, _fy+_famRowH/2);
 
@@ -4336,10 +4453,13 @@ if(invaders.grid){
           ctx.font='700 10px Barlow, sans-serif';
           const _cntW=ctx.measureText(_cntStr).width+8;
           roundRect(sx+sw-12-_cntW, _fy+4, _cntW, _famRowH-8, 5);
-          ctx.fillStyle=hexToRgba(_sf2.color, _isHov ? 0.56 : 0.36); ctx.fill();
+          ctx.fillStyle=hexToRgba(_sf2.color, _lit ? 0.56 : 0.36); ctx.fill();
           ctx.fillStyle='rgba(255,255,255,0.88)';
           ctx.textAlign='center'; ctx.textBaseline='middle';
           ctx.fillText(_cntStr, sx+sw-12-_cntW/2, _fy+_famRowH/2);
+
+          // clickable: browse this family's members in the card below
+          addButton(sx+12, _fy, sw-24, _famRowH, '', ((f)=>()=>night.selectFamily(f))(_sf2.fam), {ghost:true});
 
           _fy += _famRowStep;
         }
@@ -4368,20 +4488,26 @@ if(invaders.grid){
       ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.stroke();
 
       if(sel){
-        const _imgH = Math.min(150, Math.floor(panelH*0.44));
+        const _imgH = Math.min(132, Math.floor(panelH*0.36));
         const imgBox={x:sx+18, y:panelY+10, w:sw-36, h:_imgH};
         roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,10);
         ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.fill();
         ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.stroke();
         if(sel.img && sel.img.ready && sel.img.ok && sel.img.img){
           drawFitImage(imgBox, sel.img.img, 4, 10);
+        } else {
+          ctx.fillStyle='rgba(255,255,255,0.36)';
+          ctx.font='600 11px Barlow, sans-serif';
+          ctx.textAlign='center'; ctx.textBaseline='middle';
+          ctx.fillText('loading…', imgBox.x+imgBox.w/2, imgBox.y+imgBox.h/2);
         }
 
         const _txW = sw-44;
+        const _famColor = night.getFamilyColor(sel.fam);
         let _ety = imgBox.y+imgBox.h+9;
         ctx.textAlign='left'; ctx.textBaseline='top';
 
-        // common name — primary headline (1b)
+        // common name — primary headline
         if(sel.common){
           ctx.fillStyle='rgba(255,255,255,0.95)';
           ctx.font='900 14px Barlow, sans-serif';
@@ -4389,49 +4515,73 @@ if(invaders.grid){
           for(const ln of _cnL.slice(0,2)){ ctx.fillText(ln, sx+22, _ety); _ety+=17; }
         }
 
-        // scientific name italic (smaller, dimmer)
-        ctx.fillStyle='rgba(255,255,255,0.52)';
+        // scientific name italic
+        ctx.fillStyle='rgba(255,255,255,0.55)';
         ctx.font='italic 600 11px Barlow, sans-serif';
         const _snL=wrapText(sel.sci, _txW, ctx.font);
         for(const ln of _snL.slice(0,1)){ ctx.fillText(ln, sx+22, _ety); _ety+=14; }
 
-        _ety+=4;
-
-        // family chip
-        if(sel.fam && sel.fam!=='(no family)'){
-          const _chipFont='600 10px Barlow, sans-serif';
-          ctx.font=_chipFont;
-          const _chipTxt = sel.fam.length>24 ? sel.fam.slice(0,22)+'…' : sel.fam;
-          const _chipW = Math.min(ctx.measureText(_chipTxt).width+14, _txW);
-          roundRect(sx+22, _ety, _chipW, 18, 5);
-          ctx.fillStyle=hexToRgba(palette.purple, 0.32); ctx.fill();
-          ctx.strokeStyle=hexToRgba(palette.purple, 0.52); ctx.lineWidth=1; ctx.stroke();
-          ctx.fillStyle=hexToRgba(palette.purple, 0.98);
-          ctx.textAlign='left'; ctx.textBaseline='middle';
-          ctx.fillText(_chipTxt, sx+29, _ety+9);
-          _ety+=24;
-        }
-
-        // time observed
+        // record count in whole set + time observed, combined on one line
+        const _rec=night.speciesRecord(sel);
         const _tObs=night.formatObservedTime(sel);
-        if(_tObs){
-          ctx.fillStyle='rgba(255,255,255,0.38)';
-          ctx.font='500 10px Barlow, sans-serif';
-          ctx.textAlign='left'; ctx.textBaseline='top';
-          ctx.fillText(_tObs, sx+22, _ety);
-          _ety+=14;
+        let _info='';
+        if(_rec) _info = '#'+_rec.pos+' of '+_rec.total+' record'+(_rec.total===1?'':'s');
+        if(_tObs) _info += (_info?'  ·  ':'') + _tObs;
+        if(_info){
+          ctx.fillStyle=hexToRgba(palette.purple,0.92);
+          ctx.font='700 11px Barlow, sans-serif';
+          ctx.fillText(_info, sx+22, _ety);
+          _ety+=17;
         }
 
-        // navigation: ← [N/total] →
-        if(night.sprites.length > 1){
-          const _nBH=26, _nBW=30, _nY=panelY+panelH-74;
+        // taxonomy block — every available rank, Family tinted to its legend colour
+        const _navY=panelY+panelH-74;
+        const _taxBottom=_navY-8;
+        const _tax=getTaxonomy(sel.idx);
+        if(_tax.length && _ety < _taxBottom-12){
+          ctx.fillStyle=hexToRgba(palette.purple,0.62);
+          ctx.font='800 9px Barlow, sans-serif';
+          ctx.fillText('TAXONOMY', sx+22, _ety); _ety+=13;
+          const _valX=sx+22+62;
+          const _maxValW=(sx+sw-20)-_valX;
+          for(const t of _tax){
+            if(_ety > _taxBottom-11){
+              ctx.fillStyle='rgba(255,255,255,0.40)';
+              ctx.font='600 9px Barlow, sans-serif';
+              ctx.fillText('+'+(_tax.length-_tax.indexOf(t))+' more…', sx+22, _ety);
+              _ety+=12; break;
+            }
+            const _isFam=(t.col==='taxon_family_name');
+            ctx.fillStyle='rgba(255,255,255,0.38)';
+            ctx.font='600 10px Barlow, sans-serif';
+            ctx.textAlign='left'; ctx.textBaseline='top';
+            ctx.fillText(t.rank, sx+22, _ety);
+            let _val=t.name;
+            ctx.font=(_isFam?'800 ':'600 ')+'10px Barlow, sans-serif';
+            while(_val.length>3 && ctx.measureText(_val).width>_maxValW) _val=_val.slice(0,-2);
+            if(_val!==t.name) _val=_val.replace(/…?$/,'…');
+            ctx.fillStyle=_isFam ? _famColor : 'rgba(255,255,255,0.84)';
+            ctx.fillText(_val, _valX, _ety);
+            _ety+=13;
+          }
+        }
+
+        // navigation: ◀ [N / total] ▶  (walks cardList — all arrivals, or one family)
+        if(night.cardList.length > 1){
+          const _nBH=26, _nBW=30, _nY=_navY;
           addButton(sx+18, _nY, _nBW, _nBH, '◀', ()=>night.modalPrev(), {fontSize:12, r:7});
           addButton(sx+sw-18-_nBW, _nY, _nBW, _nBH, '▶', ()=>night.modalNext(), {fontSize:12, r:7});
-          ctx.fillStyle='rgba(255,255,255,0.46)';
-          ctx.font='600 11px Barlow, sans-serif';
+          ctx.fillStyle='rgba(255,255,255,0.55)';
+          ctx.font='700 11px Barlow, sans-serif';
           ctx.textAlign='center'; ctx.textBaseline='middle';
-          const _nc = night.modalIdx!=null ? (night.modalIdx+1)+' / '+night.sprites.length : '— / '+night.sprites.length;
-          ctx.fillText(_nc, sx+sw/2, _nY+_nBH/2);
+          const _nc = (night.cardPos+1)+' / '+night.cardList.length;
+          ctx.fillText(_nc, sx+sw/2, _nY+_nBH/2-6);
+          if(night.browseFam){
+            ctx.fillStyle=hexToRgba(_famColor,0.95);
+            ctx.font='600 9px Barlow, sans-serif';
+            const _bf=night.browseFam.length>22?night.browseFam.slice(0,20)+'…':night.browseFam;
+            ctx.fillText(_bf, sx+sw/2, _nY+_nBH/2+7);
+          }
         }
 
         addButton(sx+18, panelY+panelH-44, sw-36, 34, 'Open observation', ()=>{
@@ -4443,7 +4593,7 @@ if(invaders.grid){
         ctx.fillStyle='rgba(255,255,255,0.38)';
         ctx.font='500 12px Barlow, sans-serif';
         ctx.textAlign='left'; ctx.textBaseline='top';
-        ctx.fillText('Tap an arrival to explore.', sx+20, panelY+14);
+        ctx.fillText('Tap an arrival, or pick a family above.', sx+20, panelY+14);
       }
       } // end if(ar.sw > 0)
 
@@ -4469,8 +4619,23 @@ if(invaders.grid){
           ctx.textAlign='left'; ctx.textBaseline='top';
           const sl2=wrapText(sel.sci||'(unknown)', mw-imgBox.w-16, ctx.font);
           for(const ln of sl2.slice(0,1)){ ctx.fillText(ln, tx, ty); ty+=16; }
-          if(sel.fam){ ctx.fillStyle='rgba(255,255,255,0.50)'; ctx.font='600 11px Barlow, sans-serif';
-            ctx.fillText(sel.fam, tx, ty); ty+=15;
+          const _mrec=night.speciesRecord(sel);
+          if(_mrec){ ctx.fillStyle=hexToRgba(palette.purple,0.92); ctx.font='700 11px Barlow, sans-serif';
+            ctx.fillText('#'+_mrec.pos+' of '+_mrec.total+' records', tx, ty); ty+=16;
+          }
+          // taxonomy under the image, full sheet width, Family tinted
+          let my=imgBox.y+imgBox.h+10;
+          const _mtax=getTaxonomy(sel.idx);
+          const _mFamColor=night.getFamilyColor(sel.fam);
+          for(const t of _mtax){
+            if(my > sheetY+sheetH-16) break;
+            const _isFam=(t.col==='taxon_family_name');
+            ctx.fillStyle='rgba(255,255,255,0.40)'; ctx.font='600 10px Barlow, sans-serif';
+            ctx.fillText(t.rank, mx, my);
+            ctx.fillStyle=_isFam?_mFamColor:'rgba(255,255,255,0.82)';
+            ctx.font=(_isFam?'800 ':'600 ')+'10px Barlow, sans-serif';
+            ctx.fillText(t.name, mx+66, my);
+            my+=13;
           }
         } else {
           ctx.fillStyle='rgba(255,255,255,0.52)'; ctx.font='600 13px Barlow, sans-serif';
