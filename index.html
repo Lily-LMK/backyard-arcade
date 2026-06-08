@@ -834,6 +834,15 @@ function bumpDay(){
       }
       return out;
     }
+    // Ranks omitted from Night Walk cards: too coarse to be informative, or
+    // already shown in the species title (genus + species).
+    const CARD_TAXON_HIDE = new Set([
+      'taxon_kingdom_name','taxon_phylum_name','taxon_subphylum_name',
+      'taxon_subclass_name','taxon_genus_name','taxon_species_name'
+    ]);
+    function getCardTaxonomy(rowIdx){
+      return getTaxonomy(rowIdx).filter(t=>!CARD_TAXON_HIDE.has(t.col));
+    }
 
     // ---------- File input ----------
     const fileInput=document.getElementById('fileInput');
@@ -4537,7 +4546,7 @@ if(invaders.grid){
         // taxonomy block — every available rank, Family tinted to its legend colour
         const _navY=panelY+panelH-74;
         const _taxBottom=_navY-8;
-        const _tax=getTaxonomy(sel.idx);
+        const _tax=getCardTaxonomy(sel.idx);
         if(_tax.length && _ety < _taxBottom-12){
           ctx.fillStyle=hexToRgba(palette.purple,0.62);
           ctx.font='800 9px Barlow, sans-serif';
@@ -4625,7 +4634,7 @@ if(invaders.grid){
           }
           // taxonomy under the image, full sheet width, Family tinted
           let my=imgBox.y+imgBox.h+10;
-          const _mtax=getTaxonomy(sel.idx);
+          const _mtax=getCardTaxonomy(sel.idx);
           const _mFamColor=night.getFamilyColor(sel.fam);
           for(const t of _mtax){
             if(my > sheetY+sheetH-16) break;
