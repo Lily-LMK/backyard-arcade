@@ -120,10 +120,13 @@
 
     // Draws img aspect-ratio-fitted and centre-clipped inside imgBox {x,y,w,h}.
     // Optional panX/panY shifts the image within the clipped box (parallax effect).
-    function drawFitImage(imgBox, img, margin, r, panX, panY){
+    // When noUpscale is true the image is never drawn larger than its native pixel
+    // size (so a 500px photo stays crisp instead of being blown up and blurred).
+    function drawFitImage(imgBox, img, margin, r, panX, panY, noUpscale){
       const ar0=img.width/img.height;
       let dw=imgBox.w-margin*2, dh=imgBox.h-margin*2;
       if(dw/dh > ar0) dw=dh*ar0; else dh=dw/ar0;
+      if(noUpscale && dw > img.width){ dw=img.width; dh=img.height; }
       const dx=imgBox.x+(imgBox.w-dw)/2+(panX||0), dy=imgBox.y+(imgBox.h-dh)/2+(panY||0);
       ctx.save();
       roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,r);
@@ -394,6 +397,10 @@
 
     let mobileInfoOpen = false;
     let invadersMobileDir = 0; // -1 left, 0 none, +1 right
+
+    // A scene can queue one draw callback here to paint ABOVE the buttons
+    // (which are all rendered at the end of the frame). Used for hover tooltips.
+    let frameOverlay = null;
 
     // ---------- Keyboard ----------
     const keysDown=new Set();
@@ -735,8 +742,8 @@ function bumpDay(){
     // Family mode uses every image-backed record that has a family.
     function buildQuizGroups(){
       const G = {
-        sci: { rows:[], rowsByOrder:{}, byFamily:{}, bySuperfamily:{}, byOrder:{}, all:[], count:{} },
-        fam: { rows:[], rowsByOrder:{}, byOrder:{}, all:[], count:{} }
+        sci: { rows:[], rowsByOrder:{}, byFamily:{}, bySuperfamily:{}, byOrder:{}, all:[], count:{}, repByName:{} },
+        fam: { rows:[], rowsByOrder:{}, byOrder:{}, all:[], count:{}, repByName:{} }
       };
 
       const sciAll=new Set(), famAll=new Set();
@@ -761,6 +768,8 @@ function bumpDay(){
           addName(sciByFam, fam, sci);
           addName(sciBySf,  sf,  sci);
           addName(sciByOrd, ord, sci);
+          // First image-backed example for each name — powers distractor previews.
+          if(G.sci.repByName[sci]===undefined) G.sci.repByName[sci]=r;
         }
 
         // Family mode — any image-backed record with a family.
@@ -769,6 +778,7 @@ function bumpDay(){
           if(ord){ pushTo(G.fam.rowsByOrder, ord, r); G.fam.count[ord]=(G.fam.count[ord]||0)+1; }
           famAll.add(fam);
           addName(famByOrd, ord, fam);
+          if(G.fam.repByName[fam]===undefined) G.fam.repByName[fam]=r;
         }
       }
 
@@ -1285,7 +1295,18 @@ function bumpDay(){
 
       roundRect(b.x,b.y,b.w,b.h,r);
 
-      if(accent){
+      if(b.opts && b.opts.solid){
+        // Opaque dark chip with a shadow — stays legible over ANY photo
+        // background (white specimens included). Used for the Open-record button.
+        ctx.save();
+        ctx.shadowColor='rgba(0,0,0,0.5)'; ctx.shadowBlur=12; ctx.shadowOffsetY=2;
+        ctx.fillStyle = hover ? 'rgba(26,31,38,0.97)' : 'rgba(16,20,26,0.90)';
+        ctx.fill();
+        ctx.restore();
+        roundRect(b.x,b.y,b.w,b.h,r);
+        ctx.strokeStyle = hover ? 'rgba(255,255,255,0.60)' : 'rgba(255,255,255,0.34)';
+        ctx.lineWidth=1.5; ctx.stroke(); ctx.lineWidth=1;
+      } else if(accent){
         const _gBtn = ctx.createLinearGradient(b.x, b.y, b.x, b.y+b.h);
         _gBtn.addColorStop(0, hexToRgba(accent, hover ? 0.35 : 0.24));
         _gBtn.addColorStop(1, hexToRgba(accent, hover ? 0.18 : 0.11));
@@ -1673,15 +1694,6 @@ function bumpDay(){
     }
 
     // ---------- Quiz ----------
-    function quizToLarge(url){
-      // iNaturalist image URLs include a size token (e.g. /medium.jpg). We only want to upscale for Quiz.
-      const u = safeStr(url).trim();
-      if(!u) return '';
-      // Replace the terminal "/medium.<ext>" with "/large.<ext>"
-      const v = u.replace(/\/medium(\.[a-z0-9]+)(\?.*)?$/i, '/large$1$2');
-      return v || u;
-    }
-
     function shuffleInPlace(arr){
       for(let i=arr.length-1;i>0;i--){ const j=rnd(i+1); [arr[i],arr[j]]=[arr[j],arr[i]]; }
       return arr;
@@ -1734,12 +1746,88 @@ function bumpDay(){
       return shuffleInPlace(distract.concat([correct]));
     }
 
-    // Feedback headline. A correct Scientific-mode answer reveals the common name
-    // when one is available (e.g. "Correct — Green-blotched Moth").
-    function quizFeedbackHeadline(q, ok){
-      if(!ok) return 'Not this one.';
-      if(q.mode==='scientific' && q.common) return 'Correct — '+q.common;
-      return 'Correct.';
+    function quizFeedbackHeadline(q, ok){ return ok ? 'Correct.' : 'Not this one.'; }
+
+    // Completion detail for the correct answer — shown whether the player was
+    // right or wrong. Always surfaces the scientific name and common name; in
+    // Scientific mode the family is added (Family mode already shows it as the
+    // answer, so there the scientific name leads instead).
+    function quizCorrectDetail(q){
+      const parts=[];
+      if(q.mode==='family'){
+        if(q.sci) parts.push(q.sci);              // the specimen's scientific name
+        if(q.common) parts.push(q.common);
+      } else {
+        if(q.common) parts.push(q.common);        // scientific name is the answer line
+        if(q.fam) parts.push('Family: '+q.fam);
+      }
+      return parts.join('   ·   ');
+    }
+
+    // Resolves a distractor's preview record — a representative photo + family —
+    // for the hover preview shown after a question is answered.
+    function quizChoiceInfo(mode, name){
+      const G = (mode==='family') ? data.quizGroups.fam : data.quizGroups.sci;
+      const rep = G && G.repByName ? G.repByName[name] : undefined;
+      if(rep===undefined) return null;
+      const row=data.rows[rep];
+      const urlMed=getCol(row,'image_url').trim();
+      return {
+        rowIdx: rep,
+        family: rowFamily(row),
+        common: getCommonName(row),
+        url: inatPhotoSize(urlMed, 'small') || urlMed
+      };
+    }
+
+    // Floating preview card for a hovered distractor: its record photo + family.
+    // Anchored near (px,py) and clamped to stay on-screen.
+    function drawQuizPreview(info, name, px, py){
+      if(!info) return;
+      const insetText=(s, maxW)=>{
+        let t=safeStr(s);
+        if(ctx.measureText(t).width<=maxW) return t;
+        while(t.length>1 && ctx.measureText(t+'…').width>maxW) t=t.slice(0,-1);
+        return t+'…';
+      };
+      const m=10, imgW=190, imgH=126, lineH=18;
+      const cardW=imgW+m*2;
+      const cardH=imgH+m*2 + lineH*2 + 4;
+
+      // Prefer to the LEFT of the cursor (the answer buttons sit on the right,
+      // the image area on the left), and vertically centred on the pointer.
+      let x = px - cardW - 20;
+      if(x < 8) x = px + 20;                       // flip right if no room left
+      x = clamp(x, 8, Math.max(8, W-8-cardW));
+      let y = clamp(py - cardH/2, 8, Math.max(8, H-8-cardH));
+
+      // Card
+      roundRect(x,y,cardW,cardH,12);
+      ctx.fillStyle='rgba(12,16,22,0.97)'; ctx.fill();
+      ctx.strokeStyle=hexToRgba(palette.green,0.55); ctx.lineWidth=1; ctx.stroke();
+
+      // Photo
+      const ix=x+m, iy=y+m;
+      roundRect(ix,iy,imgW,imgH,8);
+      ctx.fillStyle='rgba(255,255,255,0.05)'; ctx.fill();
+      const rec=loadImage(info.url);
+      if(rec.ready && rec.ok && rec.img){
+        drawFitImage({x:ix,y:iy,w:imgW,h:imgH}, rec.img, 4, 8);
+      } else {
+        ctx.fillStyle='rgba(255,255,255,0.6)';
+        ctx.font='500 12px Barlow, sans-serif';
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(rec.ready && !rec.ok ? 'No preview' : 'Loading…', ix+imgW/2, iy+imgH/2);
+      }
+
+      // Distractor name + family
+      ctx.textAlign='left'; ctx.textBaseline='top';
+      ctx.fillStyle='rgba(255,255,255,0.95)';
+      ctx.font='700 13px Barlow, sans-serif';
+      ctx.fillText(insetText(name, imgW), ix, iy+imgH+6);
+      ctx.fillStyle=hexToRgba(palette.green,0.88);
+      ctx.font='500 12px Barlow, sans-serif';
+      ctx.fillText(insetText('Family: '+(info.family||'—'), imgW), ix, iy+imgH+6+lineH);
     }
 
     const quiz = {
@@ -1836,16 +1924,28 @@ function bumpDay(){
           const choices=buildChoices(row);
           if(!choices) continue;   // can't build valid distractors — skip this row
 
+          // Medium (500px) loads far faster than large (1024px) and is plenty
+          // sharp for the quiz card. Cached in imgCache; large is the fallback.
           const urlMed=getCol(row,'image_url').trim();
-          const url=quizToLarge(urlMed) || urlMed;
+          const url=inatPhotoSize(urlMed, 'medium') || urlMed;
           const correct=(mode==='family') ? rowFamily(row) : rowSci(row);
+
+          // Pre-resolve a representative record for each distractor and start
+          // loading its small thumbnail NOW (in the background) so the post-answer
+          // hover preview is instant — the user shouldn't wait on a click.
+          const choiceInfo={};
+          for(const name of choices){
+            if(name===correct) continue;
+            const info=quizChoiceInfo(mode, name);
+            if(info){ choiceInfo[name]=info; loadImage(info.url); }
+          }
 
           this.current={
             mode, order:ord,
             idx:rowIdx, url, urlMed,
             sci:rowSci(row), fam:rowFamily(row),
             common:getCommonName(row),
-            correct, choices,
+            correct, choices, choiceInfo,
             picked:null, pickTime:null,
             _fallbackTried:false,
             img:loadImage(url)
@@ -3361,12 +3461,6 @@ const invaders = {
       const cardH = Math.min(availH, clamp(H*0.56, 300, 540));
       const left = pad, top = contentTop;
 
-      // Smooth parallax pan: tracks mouse position relative to image card centre
-      const _panCx = left + (useStacked ? Math.min(660, availW) : clamp(availW*0.62, 320, 760)) * 0.5;
-      const _panCy = top + cardH * 0.5;
-      quiz._panX = lerp(quiz._panX||0, (ui.pointer.x - _panCx) / W * 14, 0.07);
-      quiz._panY = lerp(quiz._panY||0, (ui.pointer.y - _panCy) / H * 10, 0.07);
-
       if(q && q.error){
         ctx.fillStyle='rgba(255,255,255,0.86)';
         ctx.font='600 16px Barlow, sans-serif';
@@ -3378,6 +3472,8 @@ const invaders = {
 
       if(!q.error){
       // ---------- Layout: image + answers ----------
+      // After answering, hovering a distractor shows a photo + family preview.
+      let hoverChoice=null;
       if(useStacked){
         // stacked fallback (still keeps feedback on-screen by shrinking image card)
         const cardW = Math.min(660, availW);
@@ -3401,10 +3497,10 @@ const invaders = {
           quiz.newQuestion();
           return;
         } else {
-          drawFitImage({x:left, y:top, w:cardW, h:imgCardH}, rec.img, 12, 18, quiz._panX, quiz._panY);
-          addButton(left+cardW-170, top+14, 156, 40, 'Open record', ()=>{
+          drawFitImage({x:left, y:top, w:cardW, h:imgCardH}, rec.img, 12, 18, 0, 0, true);
+          addButton(left+cardW-170, top+14, 156, 40, '↗  Open record', ()=>{
             try{ window.open(getRecordUrl(data.rows[q.idx]) || q.url, '_blank'); }catch(_){}
-          }, {fontSize:14, r:12});
+          }, {fontSize:14, r:12, solid:true});
         }
 
         // choices below, but we cap sizes to fit the viewport
@@ -3429,7 +3525,10 @@ const invaders = {
             const _e=Math.min(400, performance.now()-q.pickTime);
             bOpts.scale = 1 + Math.sin(_e/400*Math.PI)*0.05;
           }
-          addButton(left, choiceTop+i*(ch+gapY), cw, ch, label, ()=>{
+          const cRect={x:left, y:choiceTop+i*(ch+gapY), w:cw, h:ch};
+          if(q.picked!=null && label!==q.correct && q.choiceInfo[label] && hitRect(cRect, ui.pointer.x, ui.pointer.y))
+            hoverChoice=label;
+          addButton(cRect.x, cRect.y, cRect.w, cRect.h, label, ()=>{
             if(paused) return;
             if(q.picked!=null) return;
             q.picked=label; q.pickTime=performance.now();
@@ -3450,6 +3549,13 @@ const invaders = {
           ctx.fillStyle='rgba(255,255,255,0.72)';
           ctx.font='500 14px Barlow, sans-serif';
           ctx.fillText('Answer: '+q.correct, left, fbY+26);
+
+          const detail=quizCorrectDetail(q);
+          if(detail){
+            ctx.fillStyle='rgba(255,255,255,0.52)';
+            ctx.font='500 13px Barlow, sans-serif';
+            ctx.fillText(detail, left, fbY+46);
+          }
         }
 
       } else {
@@ -3479,10 +3585,10 @@ const invaders = {
           quiz.newQuestion();
           return;
         } else {
-          drawFitImage({x:left, y:top, w:cardW, h:cardH}, rec.img, 12, 18, quiz._panX, quiz._panY);
-          addButton(left+cardW-170, top+14, 156, 40, 'Open record', ()=>{
+          drawFitImage({x:left, y:top, w:cardW, h:cardH}, rec.img, 12, 18, 0, 0, true);
+          addButton(left+cardW-170, top+14, 156, 40, '↗  Open record', ()=>{
             try{ window.open(getRecordUrl(data.rows[q.idx]) || q.url, '_blank'); }catch(_){}
-          }, {fontSize:14, r:12});
+          }, {fontSize:14, r:12, solid:true});
         }
 
         // Answer panel
@@ -3516,7 +3622,10 @@ const invaders = {
             const _e=Math.min(400, performance.now()-q.pickTime);
             bOpts.scale = 1 + Math.sin(_e/400*Math.PI)*0.05;
           }
-          addButton(panelX+padIn, topY+i*(ch+gapY), panelW-padIn*2, ch, label, ()=>{
+          const cRect={x:panelX+padIn, y:topY+i*(ch+gapY), w:panelW-padIn*2, h:ch};
+          if(q.picked!=null && label!==q.correct && q.choiceInfo[label] && hitRect(cRect, ui.pointer.x, ui.pointer.y))
+            hoverChoice=label;
+          addButton(cRect.x, cRect.y, cRect.w, cRect.h, label, ()=>{
             if(paused) return;
             if(q.picked!=null) return;
             q.picked=label; q.pickTime=performance.now();
@@ -3541,8 +3650,12 @@ const invaders = {
           ctx.font='600 14px Barlow, sans-serif';
           ctx.fillText('Answer: '+q.correct, fbX, fbY+30);
 
-          ctx.fillStyle='rgba(255,255,255,0.48)';
-          ctx.font='500 12px Barlow, sans-serif';
+          const detail=quizCorrectDetail(q);
+          if(detail){
+            ctx.fillStyle='rgba(255,255,255,0.52)';
+            ctx.font='500 12px Barlow, sans-serif';
+            ctx.fillText(detail, fbX, fbY+52);
+          }
 
         } else {
           // subtle hint
@@ -3551,6 +3664,14 @@ const invaders = {
           ctx.textAlign='left'; ctx.textBaseline='bottom';
 
         }
+      }
+
+      // Distractor hover preview — queued as an overlay so it paints ABOVE the
+      // answer buttons (which are all drawn at the very end of the frame).
+      if(hoverChoice){
+        const _info=q.choiceInfo[hoverChoice], _name=hoverChoice;
+        const _px=ui.pointer.x, _py=ui.pointer.y;
+        frameOverlay = ()=> drawQuizPreview(_info, _name, _px, _py);
       }
 
       }
@@ -4817,6 +4938,7 @@ if(invaders.grid){
         lastInteraction = t;
       }
 
+      frameOverlay = null;
       if(scene==='home') drawHome(rawDt);
       else if(scene==='quiz') drawQuiz(rawDt);
       else if(scene==='match') drawMatch(rawDt);
@@ -4832,6 +4954,9 @@ if(invaders.grid){
       }
 
       for(const b of ui.buttons) drawButton(b);
+
+      // Overlays paint above buttons (e.g. quiz distractor hover preview).
+      if(frameOverlay){ try{ frameOverlay(); }catch(_){} frameOverlay=null; }
 
       if(ui.pointer.clicked){
         const px=ui.pointer.x, py=ui.pointer.y;
