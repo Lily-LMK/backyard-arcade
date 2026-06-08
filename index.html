@@ -1099,8 +1099,8 @@ function bumpDay(){
       ctx.fillText(main, x, y);
       // accent underline
       const tw = ctx.measureText(main).width;
-      ctx.fillStyle = hexToRgba(accent, 0.7);
-      roundRect(x, y+44, Math.min(tw, 120), 3, 1.5);
+      ctx.fillStyle = hexToRgba(accent, 0.80);
+      roundRect(x, y+44, Math.min(tw, 240), 4, 2);
       ctx.fill();
       ctx.fillStyle='rgba(255,255,255,0.60)';
       ctx.font='400 15px Barlow, sans-serif';
@@ -1125,28 +1125,31 @@ function bumpDay(){
       roundRect(b.x,b.y,b.w,b.h,r);
 
       if(accent){
-        const base = hover ? 0.28 : 0.18;
-        ctx.fillStyle = hexToRgba(accent, base);
-        ctx.fill();
-        ctx.strokeStyle = hexToRgba(accent, hover ? 0.55 : 0.35);
-        ctx.lineWidth=1.5;
-        ctx.stroke();
-        ctx.lineWidth=1;
-        // accent bar on the left
+        const _gBtn = ctx.createLinearGradient(b.x, b.y, b.x, b.y+b.h);
+        _gBtn.addColorStop(0, hexToRgba(accent, hover ? 0.35 : 0.24));
+        _gBtn.addColorStop(1, hexToRgba(accent, hover ? 0.18 : 0.11));
+        ctx.fillStyle = _gBtn; ctx.fill();
+        ctx.strokeStyle = hexToRgba(accent, hover ? 0.62 : 0.40);
+        ctx.lineWidth=1.5; ctx.stroke(); ctx.lineWidth=1;
         if(b.h > 44){
           roundRect(b.x, b.y, 4, b.h, 2);
-          ctx.fillStyle = hexToRgba(accent, hover ? 0.9 : 0.65);
+          ctx.fillStyle = hexToRgba(accent, hover ? 0.92 : 0.68);
           ctx.fill();
         }
       } else {
-        const base= isPrimary ? 0.16 : 0.10;
-        const hov = isPrimary ? 0.22 : 0.15;
-        ctx.fillStyle= hover ? ('rgba(255,255,255,'+hov+')') : ('rgba(255,255,255,'+base+')');
-        ctx.fill();
-        ctx.strokeStyle=hover ? 'rgba(255,255,255,0.32)' : 'rgba(255,255,255,0.18)';
-        ctx.lineWidth=1;
-        ctx.stroke();
+        const base = isPrimary ? 0.16 : 0.09;
+        const hov  = isPrimary ? 0.24 : 0.16;
+        const _gBtn2 = ctx.createLinearGradient(b.x, b.y, b.x, b.y+b.h);
+        _gBtn2.addColorStop(0, hover ? ('rgba(255,255,255,'+(hov+0.05)+')') : ('rgba(255,255,255,'+(base+0.05)+')'));
+        _gBtn2.addColorStop(1, hover ? ('rgba(255,255,255,'+hov+')') : ('rgba(255,255,255,'+base+')'));
+        ctx.fillStyle = _gBtn2; ctx.fill();
+        ctx.strokeStyle = hover ? 'rgba(255,255,255,0.36)' : 'rgba(255,255,255,0.20)';
+        ctx.lineWidth=1; ctx.stroke();
       }
+      // Gloss highlight (top inner edge)
+      const _hlH = Math.min(5, b.h*0.08);
+      roundRect(b.x+2, b.y+2, b.w-4, _hlH, Math.min(r, 4));
+      ctx.fillStyle = 'rgba(255,255,255,0.07)'; ctx.fill();
       if(b.label){
         ctx.fillStyle= accent ? (hover ? 'rgba(255,255,255,0.97)' : 'rgba(255,255,255,0.90)') : 'rgba(255,255,255,0.93)';
         const fs=(b.opts && b.opts.fontSize) ? b.opts.fontSize : 16;
@@ -2812,8 +2815,15 @@ const invaders = {
       clearButtons();
       const pad=Math.max(18, Math.min(44, W*0.05));
 
+      // Atmospheric glow behind brand area
+      const _bgGlow = ctx.createRadialGradient(pad+220, pad+26, 0, pad+220, pad+26, 270);
+      _bgGlow.addColorStop(0, 'rgba(0,165,97,0.11)');
+      _bgGlow.addColorStop(1, 'rgba(0,165,97,0)');
+      ctx.fillStyle = _bgGlow;
+      ctx.fillRect(0, 0, Math.min(W, 580), 140);
+
       // Brand title
-      ctx.fillStyle='rgba(255,255,255,0.96)';
+      ctx.fillStyle='rgba(255,255,255,0.97)';
       ctx.font='900 42px Barlow, sans-serif';
       ctx.textAlign='left'; ctx.textBaseline='top';
       ctx.fillText('BACKYARD ARCADE', pad, pad);
@@ -2822,11 +2832,11 @@ const invaders = {
       const barColors = [palette.green, palette.blue, palette.red, palette.orange, palette.purple, palette.pink];
       const segW = tw / barColors.length;
       for(let i=0;i<barColors.length;i++){
-        ctx.fillStyle = hexToRgba(barColors[i], 0.85);
-        ctx.fillRect(pad + i*segW, pad+50, segW+1, 3);
+        ctx.fillStyle = hexToRgba(barColors[i], 0.90);
+        ctx.fillRect(pad + i*segW, pad+50, segW+1, 4);
       }
 
-      ctx.fillStyle='rgba(255,255,255,0.50)';
+      ctx.fillStyle='rgba(255,255,255,0.58)';
       ctx.font='400 14px Barlow, sans-serif';
       ctx.fillText('Interactive study from your iNaturalist observations', pad, pad+62);
 
@@ -2837,7 +2847,7 @@ const invaders = {
       addButton(W-pad-38-8-100-8-160, pad+10, 160, 38, 'Load iNat', ()=>showINatModal(), {fontSize:14, r:10, accent:palette.green});
 
       // Instruction text
-      ctx.fillStyle='rgba(255,255,255,0.35)';
+      ctx.fillStyle='rgba(255,255,255,0.44)';
       ctx.font='400 13px Barlow, sans-serif';
       ctx.fillText('Load from iNaturalist above  •  or drag-drop a CSV  •  Press ? for shortcuts', pad, pad+86);
 
@@ -2858,7 +2868,7 @@ const invaders = {
       const useCols = (availW >= 580) ? 2 : 1;
       const gap = 14;
       const cardW = useCols===2 ? Math.min(480, (availW - gap)/2) : Math.min(480, availW);
-      const cardH = Math.min(72, Math.max(58, (availH - gap*(cards.length/useCols -1)) / Math.ceil(cards.length/useCols)));
+      const cardH = Math.min(88, Math.max(62, (availH - gap*(cards.length/useCols -1)) / Math.ceil(cards.length/useCols)));
 
       for(let i=0;i<cards.length;i++){
         const c = cards[i];
@@ -2866,32 +2876,60 @@ const invaders = {
         const row = Math.floor(i / useCols);
         const cx = pad + col*(cardW + gap);
         const cy = startY + row*(cardH + gap);
+        const _hover = hitRect({x:cx,y:cy,w:cardW,h:cardH}, ui.pointer.x, ui.pointer.y);
 
-        addButton(cx, cy, cardW, cardH, '', c.fn, {r:14, accent:c.color});
+        // Card glow on hover
+        if(_hover){
+          ctx.save();
+          ctx.shadowColor = hexToRgba(c.color, 0.50);
+          ctx.shadowBlur = 24;
+          roundRect(cx, cy, cardW, cardH, 14);
+          ctx.strokeStyle = hexToRgba(c.color, 0.65);
+          ctx.lineWidth = 1.5; ctx.stroke(); ctx.lineWidth = 1;
+          ctx.restore();
+        }
+
+        // Card gradient background
+        const _cGrad = ctx.createLinearGradient(cx, cy, cx + cardW*0.75, cy + cardH);
+        _cGrad.addColorStop(0, hexToRgba(c.color, _hover ? 0.28 : 0.18));
+        _cGrad.addColorStop(1, hexToRgba(c.color, _hover ? 0.07 : 0.04));
+        roundRect(cx, cy, cardW, cardH, 14);
+        ctx.fillStyle = _cGrad; ctx.fill();
+        ctx.strokeStyle = hexToRgba(c.color, _hover ? 0.55 : 0.30);
+        ctx.lineWidth = 1.5; ctx.stroke(); ctx.lineWidth = 1;
+
+        // Left accent bar
+        roundRect(cx, cy + 8, 4, cardH - 16, 2);
+        ctx.fillStyle = hexToRgba(c.color, _hover ? 0.95 : 0.72);
+        ctx.fill();
 
         // Icon circle
         const iconR = cardH*0.28;
-        const iconCx = cx + 20 + iconR;
+        const iconCx = cx + 24 + iconR;
         const iconCy = cy + cardH/2;
         ctx.beginPath(); ctx.arc(iconCx, iconCy, iconR, 0, Math.PI*2);
-        ctx.fillStyle = hexToRgba(c.color, 0.25);
+        ctx.fillStyle = hexToRgba(c.color, 0.20);
         ctx.fill();
-        ctx.fillStyle = hexToRgba(c.color, 0.9);
-        ctx.font='700 '+(iconR*1.1)+'px Barlow, sans-serif';
+        ctx.strokeStyle = hexToRgba(c.color, 0.44);
+        ctx.lineWidth = 1; ctx.stroke();
+        ctx.fillStyle = hexToRgba(c.color, _hover ? 1.0 : 0.92);
+        ctx.font='700 '+Math.round(iconR*1.1)+'px Barlow, sans-serif';
         ctx.textAlign='center'; ctx.textBaseline='middle';
         ctx.fillText(c.icon, iconCx, iconCy);
 
         // Label
         const textX = iconCx + iconR + 16;
-        ctx.fillStyle='rgba(255,255,255,0.94)';
+        ctx.fillStyle = _hover ? 'rgba(255,255,255,1.00)' : 'rgba(255,255,255,0.94)';
         ctx.font='700 17px Barlow, sans-serif';
         ctx.textAlign='left'; ctx.textBaseline='middle';
         ctx.fillText(c.label, textX, cy + cardH*0.38);
 
         // Subtitle
-        ctx.fillStyle='rgba(255,255,255,0.45)';
+        ctx.fillStyle = _hover ? 'rgba(255,255,255,0.62)' : 'rgba(255,255,255,0.46)';
         ctx.font='400 13px Barlow, sans-serif';
-        ctx.fillText(c.sub, textX, cy + cardH*0.65);
+        ctx.fillText(c.sub, textX, cy + cardH*0.67);
+
+        addButton(cx, cy, cardW, cardH, '', c.fn, {ghost:true});
       }
 
       // CSV status indicator at the bottom
@@ -3109,8 +3147,8 @@ const invaders = {
 
         // Answer panel
         roundRect(panelX, panelY, panelW, panelH, 18);
-        ctx.fillStyle=hexToRgba(palette.green, 0.04); ctx.fill();
-        ctx.strokeStyle=hexToRgba(palette.green, 0.16); ctx.lineWidth=1; ctx.stroke();
+        ctx.fillStyle=hexToRgba(palette.green, 0.08); ctx.fill();
+        ctx.strokeStyle=hexToRgba(palette.green, 0.26); ctx.lineWidth=1; ctx.stroke();
 
         const padIn = 16;
         ctx.fillStyle='rgba(255,255,255,0.86)';
