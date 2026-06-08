@@ -262,6 +262,15 @@
       _fireflyGlow = null;
     }
     function isMobile(){ return W < 600; }
+    function hasTouch(){ return navigator.maxTouchPoints > 0 || ('ontouchstart' in window); }
+    function drawArrowTri(cx, cy, dir, size, color){
+      ctx.beginPath();
+      if(dir==='up'){    ctx.moveTo(cx,cy-size); ctx.lineTo(cx+size*0.82,cy+size*0.58); ctx.lineTo(cx-size*0.82,cy+size*0.58); }
+      else if(dir==='down'){ ctx.moveTo(cx,cy+size); ctx.lineTo(cx+size*0.82,cy-size*0.58); ctx.lineTo(cx-size*0.82,cy-size*0.58); }
+      else if(dir==='left'){ ctx.moveTo(cx-size,cy); ctx.lineTo(cx+size*0.58,cy-size*0.82); ctx.lineTo(cx+size*0.58,cy+size*0.82); }
+      else{ ctx.moveTo(cx+size,cy); ctx.lineTo(cx-size*0.58,cy-size*0.82); ctx.lineTo(cx-size*0.58,cy+size*0.82); }
+      ctx.closePath(); ctx.fillStyle=color; ctx.fill();
+    }
 
     // ---------- UI ----------
     const ui = {
@@ -2828,7 +2837,7 @@ const invaders = {
       }
 
       // Invaders mobile touch buttons (hold left/right)
-      if(scene==='invaders' && isMobile()){
+      if(scene==='invaders' && hasTouch()){
         const mpad=Math.max(18, Math.min(44, W*0.05));
         const btnH=52, btnW=90, btnY=H-mpad-btnH;
         const px=ui.pointer.x, py=ui.pointer.y;
@@ -2859,7 +2868,7 @@ const invaders = {
     }
     function pointerMove(){
       // Invaders mobile: update hold direction on drag
-      if(scene==='invaders' && isMobile() && ui.pointer.down){
+      if(scene==='invaders' && hasTouch() && ui.pointer.down){
         const mpad=Math.max(18, Math.min(44, W*0.05));
         const btnH=52, btnW=90, btnY=H-mpad-btnH;
         const px=ui.pointer.x, py=ui.pointer.y;
@@ -3652,11 +3661,22 @@ if(hit){
 } // end if(ar.sw > 0)
 
 // Mobile: touch buttons for ship movement + fire
-if(isMobile()){
+if(hasTouch()){
   const btnH=52, btnW=90, btnY=H-pad-btnH;
-  addButton(pad, btnY, btnW, btnH, '◀', ()=>{}, {fontSize:22, r:14, accent:palette.red});
-  addButton(pad+btnW+12, btnY, btnW, btnH, '▶', ()=>{}, {fontSize:22, r:14, accent:palette.red});
-  addButton(W-pad-100, btnY, 100, btnH, '● FIRE', ()=>invaders.fire(), {fontSize:15, r:14, accent:palette.red, primary:true});
+  // Left
+  roundRect(pad, btnY, btnW, btnH, 14);
+  ctx.fillStyle=hexToRgba(palette.red,0.14); ctx.fill();
+  ctx.strokeStyle=hexToRgba(palette.red,0.40); ctx.lineWidth=1; ctx.stroke();
+  drawArrowTri(pad+btnW/2, btnY+btnH/2, 'left', 13, 'rgba(255,255,255,0.82)');
+  addButton(pad, btnY, btnW, btnH, '', ()=>{}, {ghost:true});
+  // Right
+  roundRect(pad+btnW+12, btnY, btnW, btnH, 14);
+  ctx.fillStyle=hexToRgba(palette.red,0.14); ctx.fill();
+  ctx.strokeStyle=hexToRgba(palette.red,0.40); ctx.lineWidth=1; ctx.stroke();
+  drawArrowTri(pad+btnW+12+btnW/2, btnY+btnH/2, 'right', 13, 'rgba(255,255,255,0.82)');
+  addButton(pad+btnW+12, btnY, btnW, btnH, '', ()=>{}, {ghost:true});
+  // Fire
+  addButton(W-pad-100, btnY, 100, btnH, 'FIRE', ()=>invaders.fire(), {fontSize:15, r:14, accent:palette.red, primary:true});
 }
 
 // Mobile info overlay: show last captured specimen
@@ -4046,25 +4066,22 @@ if(invaders.grid){
       const dpadBx = ar.x + (ar.w - dpadW)/2;  // centered under the game
       const dpadBy = ar.y + ar.h + 14;
 
-      const upB    = {x:dpadBx+dpadS+dpadG, y:dpadBy,                w:dpadS, h:dpadS, label:'▲'};
-      const leftB  = {x:dpadBx,             y:dpadBy+dpadS+dpadG,    w:dpadS, h:dpadS, label:'◀'};
-      const rightB = {x:dpadBx+(dpadS+dpadG)*2, y:dpadBy+dpadS+dpadG, w:dpadS, h:dpadS, label:'▶'};
-      const downB  = {x:dpadBx+dpadS+dpadG, y:dpadBy+(dpadS+dpadG)*2, w:dpadS, h:dpadS, label:'▼'};
+      const upB    = {x:dpadBx+dpadS+dpadG, y:dpadBy,                w:dpadS, h:dpadS, dir:'up'};
+      const leftB  = {x:dpadBx,             y:dpadBy+dpadS+dpadG,    w:dpadS, h:dpadS, dir:'left'};
+      const rightB = {x:dpadBx+(dpadS+dpadG)*2, y:dpadBy+dpadS+dpadG, w:dpadS, h:dpadS, dir:'right'};
+      const downB  = {x:dpadBx+dpadS+dpadG, y:dpadBy+(dpadS+dpadG)*2, w:dpadS, h:dpadS, dir:'down'};
       for(const b of [upB,leftB,rightB,downB]){
         roundRect(b.x,b.y,b.w,b.h,11);
         ctx.fillStyle=hexToRgba(palette.orange, 0.08); ctx.fill();
         ctx.strokeStyle=hexToRgba(palette.orange, 0.22); ctx.lineWidth=1; ctx.stroke();
-        ctx.fillStyle='rgba(255,255,255,0.72)';
-        ctx.font='900 15px Barlow, sans-serif';
-        ctx.textAlign='center'; ctx.textBaseline='middle';
-        ctx.fillText(b.label, b.x+b.w/2, b.y+b.h/2+1);
+        drawArrowTri(b.x+b.w/2, b.y+b.h/2, b.dir, dpadS*0.26, 'rgba(255,255,255,0.78)');
         addButton(b.x, b.y, b.w, b.h, '', (()=>{
-          const lbl=b.label;
+          const d=b.dir;
           return ()=>{
-            if(lbl==='▲') snake.setDir(0,-1);
-            else if(lbl==='▼') snake.setDir(0,1);
-            else if(lbl==='◀') snake.setDir(-1,0);
-            else if(lbl==='▶') snake.setDir(1,0);
+            if(d==='up') snake.setDir(0,-1);
+            else if(d==='down') snake.setDir(0,1);
+            else if(d==='left') snake.setDir(-1,0);
+            else if(d==='right') snake.setDir(1,0);
           };
         })(), {ghost:true});
       }
