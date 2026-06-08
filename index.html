@@ -528,6 +528,7 @@ function bumpDay(){
       orders:[],
       idxByOrder:{},   // order -> {any:[], sci:[], fam:[]}
       uniquesByOrder:{}, // order -> {sci:[], fam:[]}
+      quizGroups:null,  // taxonomy-aware indexes the Quiz uses (built by buildQuizGroups)
 
       badImage:new Set(),
       keys:{ common:null, date:null, time:null, url:null },
@@ -573,6 +574,20 @@ function bumpDay(){
       const idx=data.colMap[key];
       if(idx==null) return '';
       return safeStr(row[idx] ?? '');
+    }
+
+    // Row taxonomy accessors — keep the Quiz logic readable.
+    function rowOrder(row){ return getCol(row,'taxon_order_name').trim(); }
+    function rowFamily(row){ return getCol(row,'taxon_family_name').trim(); }
+    function rowSuperfamily(row){ return getCol(row,'taxon_superfamily_name').trim(); }
+    function rowSci(row){ return getCol(row,'scientific_name').trim(); }
+
+    // Research-grade check. Datasets without a quality_grade column (e.g. the
+    // legacy CSV export) treat every record as usable; iNat API imports set
+    // quality_grade='research' explicitly since the API requests research-grade.
+    function isResearchGrade(row){
+      if(data.colMap['quality_grade']==null) return true;
+      return getCol(row,'quality_grade').trim().toLowerCase()==='research';
     }
 
     function detectKeys(){
@@ -711,6 +726,61 @@ function bumpDay(){
           fam: Array.from(famByOrder.get(o) || []).sort((a,b)=>a.localeCompare(b))
         };
       }
+
+      buildQuizGroups();
+    }
+
+    // Builds the taxonomy-aware indexes the Quiz uses to choose correct rows and
+    // taxonomically valid distractors. Scientific mode honours research-grade;
+    // Family mode uses every image-backed record that has a family.
+    function buildQuizGroups(){
+      const G = {
+        sci: { rows:[], rowsByOrder:{}, byFamily:{}, bySuperfamily:{}, byOrder:{}, all:[], count:{} },
+        fam: { rows:[], rowsByOrder:{}, byOrder:{}, all:[], count:{} }
+      };
+
+      const sciAll=new Set(), famAll=new Set();
+      const sciByFam=new Map(), sciBySf=new Map(), sciByOrd=new Map();
+      const famByOrd=new Map();
+
+      const addName=(map,key,name)=>{
+        if(!key) return;
+        let s=map.get(key); if(!s){ s=new Set(); map.set(key,s); } s.add(name);
+      };
+      const pushTo=(obj,key,val)=>{ (obj[key] || (obj[key]=[])).push(val); };
+
+      for(const r of data.idx.any){
+        const row=data.rows[r];
+        const ord=rowOrder(row), fam=rowFamily(row), sf=rowSuperfamily(row), sci=rowSci(row);
+
+        // Scientific mode — research-grade rows only.
+        if(sci && isResearchGrade(row)){
+          G.sci.rows.push(r);
+          if(ord){ pushTo(G.sci.rowsByOrder, ord, r); G.sci.count[ord]=(G.sci.count[ord]||0)+1; }
+          sciAll.add(sci);
+          addName(sciByFam, fam, sci);
+          addName(sciBySf,  sf,  sci);
+          addName(sciByOrd, ord, sci);
+        }
+
+        // Family mode — any image-backed record with a family.
+        if(fam){
+          G.fam.rows.push(r);
+          if(ord){ pushTo(G.fam.rowsByOrder, ord, r); G.fam.count[ord]=(G.fam.count[ord]||0)+1; }
+          famAll.add(fam);
+          addName(famByOrd, ord, fam);
+        }
+      }
+
+      const toArrays=(map,dest)=>{ for(const [k,s] of map) dest[k]=Array.from(s); };
+      toArrays(sciByFam, G.sci.byFamily);
+      toArrays(sciBySf,  G.sci.bySuperfamily);
+      toArrays(sciByOrd, G.sci.byOrder);
+      toArrays(famByOrd, G.fam.byOrder);
+      G.sci.all=Array.from(sciAll);
+      G.fam.all=Array.from(famAll);
+
+      data.quizGroups=G;
     }
 
     function buildNightIndex(){
@@ -1000,7 +1070,7 @@ function bumpDay(){
           tribe:'taxon_tribe_name', subtribe:'taxon_subtribe_name', genus:'taxon_genus_name'
         };
         const RANK_COLS = Object.values(RANK_COL);
-        const HEADERS = ['scientific_name','common_name','image_url','observed_on','url'].concat(RANK_COLS);
+        const HEADERS = ['scientific_name','common_name','image_url','observed_on','url','quality_grade'].concat(RANK_COLS);
         const inatColMap = {};
         HEADERS.forEach((h, i) => { inatColMap[h] = i; });
 
@@ -1032,7 +1102,9 @@ function bumpDay(){
             safeStr(taxon.preferred_common_name || ''),
             imageUrl,
             safeStr(obs.observed_on || ''),
-            safeStr(obs.uri || '')
+            safeStr(obs.uri || ''),
+            // The API query requests quality_grade=research, so preserve that internally.
+            safeStr(obs.quality_grade || 'research')
           ];
           for(const col of RANK_COLS) row.push(ranks[col] || '');
           rows.push(row);
@@ -1609,6 +1681,67 @@ function bumpDay(){
       const v = u.replace(/\/medium(\.[a-z0-9]+)(\?.*)?$/i, '/large$1$2');
       return v || u;
     }
+
+    function shuffleInPlace(arr){
+      for(let i=arr.length-1;i>0;i--){ const j=rnd(i+1); [arr[i],arr[j]]=[arr[j],arr[i]]; }
+      return arr;
+    }
+
+    // Collects up to `need` distinct names from tiered candidate pools, in order
+    // of priority, excluding `exclude` and any name already chosen. Each tier is
+    // shuffled so repeated questions vary. Returns the collected names.
+    function collectDistinct(tiers, exclude, need){
+      const out=[], seen=new Set([exclude]);
+      for(const pool of tiers){
+        if(out.length>=need) break;
+        if(!pool || !pool.length) continue;
+        const shuffled=shuffleInPlace(pool.slice());
+        for(const name of shuffled){
+          if(out.length>=need) break;
+          if(!name || seen.has(name)) continue;
+          seen.add(name); out.push(name);
+        }
+      }
+      return out;
+    }
+
+    // Scientific mode: distractors prefer the same family, then superfamily, then
+    // order. Returns four shuffled distinct scientific names, or null if the row
+    // can't yield three taxonomically valid distractors (caller skips the row).
+    function buildScientificChoices(row){
+      const correct=rowSci(row);
+      if(!correct) return null;
+      const G=data.quizGroups.sci;
+      const tiers=[
+        G.byFamily[rowFamily(row)],
+        G.bySuperfamily[rowSuperfamily(row)],
+        G.byOrder[rowOrder(row)]
+      ];
+      const distract=collectDistinct(tiers, correct, 3);
+      if(distract.length<3) return null;
+      return shuffleInPlace(distract.concat([correct]));
+    }
+
+    // Family mode: distractor families prefer the same order, falling back to the
+    // full family list when an order is too sparse. Returns four shuffled names.
+    function buildFamilyChoices(row){
+      const correct=rowFamily(row);
+      if(!correct) return null;
+      const G=data.quizGroups.fam;
+      const tiers=[ G.byOrder[rowOrder(row)], G.all ];
+      const distract=collectDistinct(tiers, correct, 3);
+      if(distract.length<3) return null;
+      return shuffleInPlace(distract.concat([correct]));
+    }
+
+    // Feedback headline. A correct Scientific-mode answer reveals the common name
+    // when one is available (e.g. "Correct — Green-blotched Moth").
+    function quizFeedbackHeadline(q, ok){
+      if(!ok) return 'Not this one.';
+      if(q.mode==='scientific' && q.common) return 'Correct — '+q.common;
+      return 'Correct.';
+    }
+
     const quiz = {
       current:null,
 
@@ -1633,7 +1766,7 @@ function bumpDay(){
         this.orderPicker = !this.orderPicker;
         if(this.orderPicker){
           const cur = state.settings.quizOrder || 'All';
-          const list = ['All'].concat(data.orders);
+          const list = ['All'].concat(this.orderList());
           const idx = Math.max(0, list.indexOf(cur));
           // Center the current order in the visible area (pixel scroll)
           this._scrollPx = Math.max(0, idx * 42 - 160);
@@ -1651,29 +1784,29 @@ function bumpDay(){
         toast('Quiz order: '+(o==='All'?'All orders':o), 'info', 1400);
       },
 
+      // Row pool to draw the CORRECT question from, for the current mode + order.
       getPool(mode, ord){
         const m = mode || state.settings.quizMode || 'scientific';
         const o = ord || state.settings.quizOrder || 'All';
-        const wantFam = (m==='family');
-
-        if(o==='All') return wantFam ? data.idx.fam : data.idx.sci;
-
-        if(data.idxByOrder && data.idxByOrder[o]){
-          return wantFam ? (data.idxByOrder[o].fam || []) : (data.idxByOrder[o].sci || []);
-        }
-        return wantFam ? data.idx.fam : data.idx.sci;
+        const G = (m==='family') ? data.quizGroups.fam : data.quizGroups.sci;
+        if(!G) return [];
+        if(o==='All') return G.rows;
+        return G.rowsByOrder[o] || [];
       },
 
-      getUniverse(mode, ord){
+      // Orders that have usable records in the given mode, sorted by usable
+      // record count (desc) with an alphabetical tie-break. Callers prepend "All".
+      orderList(mode){
         const m = mode || state.settings.quizMode || 'scientific';
-        const o = ord || state.settings.quizOrder || 'All';
-        const wantFam = (m==='family');
-
-        if(o!=='All' && data.uniquesByOrder && data.uniquesByOrder[o]){
-          const u = wantFam ? data.uniquesByOrder[o].fam : data.uniquesByOrder[o].sci;
-          if(u && u.length>=4) return u;
-        }
-        return wantFam ? data.uniques.fam : data.uniques.sci;
+        const G = (m==='family') ? data.quizGroups.fam : data.quizGroups.sci;
+        const counts = (G && G.count) || {};
+        return (data.orders||[])
+          .filter(o => (counts[o]||0) > 0)
+          .sort((a,b)=>{
+            const ca=counts[a]||0, cb=counts[b]||0;
+            if(cb!==ca) return cb-ca;
+            return a.localeCompare(b);
+          });
       },
 
       newQuestion(){
@@ -1682,61 +1815,46 @@ function bumpDay(){
 
         const pool = this.getPool(mode, ord);
         if(!pool || pool.length < 4){
+          const kind = (mode==='family') ? 'family' : 'research-grade';
           const msg = (ord!=='All')
-            ? `Not enough records in ${ord} for quiz (need ≥ 4 usable rows). Try “All orders” or another order.`
+            ? `Not enough ${kind} records in ${ord} for quiz (need ≥ 4 usable rows). Try “All orders” or another order.`
             : 'Not enough records for quiz (need ≥ 4 usable rows).';
           this.current={error: msg};
           return;
         }
 
-        const rowIdx=pickValidRow(pool, 900);
-        if(rowIdx==null){ this.current={error:'Could not find a usable image_url.'}; return; }
+        const buildChoices = (mode==='family') ? buildFamilyChoices : buildScientificChoices;
 
-        const row=data.rows[rowIdx];
-        const urlMed=getCol(row,'image_url').trim();
-        const url=quizToLarge(urlMed) || urlMed;
-        const sci=getCol(row,'scientific_name').trim();
-        const fam=getCol(row,'taxon_family_name').trim();
-        const correct=(mode==='family') ? fam : sci;
+        // A row is only usable if it has a valid image AND yields three
+        // taxonomically valid distractors. Try several rows before giving up.
+        let attempts=0;
+        while(attempts++ < 240){
+          const rowIdx=pickValidRow(pool, 60, mode!=='family');
+          if(rowIdx==null) break;
 
-        if(!correct){
-          // rare but possible: pool drift; just try again
-          data.badImage.add(url);
-          return this.newQuestion();
+          const row=data.rows[rowIdx];
+          const choices=buildChoices(row);
+          if(!choices) continue;   // can't build valid distractors — skip this row
+
+          const urlMed=getCol(row,'image_url').trim();
+          const url=quizToLarge(urlMed) || urlMed;
+          const correct=(mode==='family') ? rowFamily(row) : rowSci(row);
+
+          this.current={
+            mode, order:ord,
+            idx:rowIdx, url, urlMed,
+            sci:rowSci(row), fam:rowFamily(row),
+            common:getCommonName(row),
+            correct, choices,
+            picked:null, pickTime:null,
+            _fallbackTried:false,
+            img:loadImage(url)
+          };
+          return;
         }
 
-        const universe = this.getUniverse(mode, ord);
-        const distract=[];
-        let a=0;
-        while(distract.length<3 && a++<2200){
-          const cand=choose(universe);
-          if(!cand || cand===correct) continue;
-          if(distract.includes(cand)) continue;
-          distract.push(cand);
-        }
-
-        // As a fallback (tiny orders), allow global universe for distractors
-        if(distract.length<3){
-          const global = (mode==='family') ? data.uniques.fam : data.uniques.sci;
-          let b=0;
-          while(distract.length<3 && b++<2200){
-            const cand=choose(global);
-            if(!cand || cand===correct) continue;
-            if(distract.includes(cand)) continue;
-            distract.push(cand);
-          }
-        }
-
-        const choices=distract.concat([correct]);
-        for(let i=choices.length-1;i>0;i--){ const j=rnd(i+1); [choices[i],choices[j]]=[choices[j],choices[i]]; }
-
-        this.current={
-          mode, order:ord,
-          idx:rowIdx, url, urlMed, sci, fam, correct, choices,
-          picked:null, pickTime:null,
-          _fallbackTried:false,
-          img:loadImage(url)
-        };
+        this.current={error:
+          `Not enough taxonomically similar records to build a question${ord!=='All'?` in ${ord}`:''}. Try another order or mode.`};
       },
 
       record(ok){
@@ -3317,7 +3435,7 @@ const invaders = {
             q.picked=label; q.pickTime=performance.now();
             const ok=(label===q.correct);
             quiz.record(ok);
-            toast(ok?'Correct.':'Not this one.', ok?'ok':'warn', 1200);
+            toast(quizFeedbackHeadline(q, ok), ok?'ok':'warn', 1200);
           }, bOpts);
         }
 
@@ -3327,7 +3445,7 @@ const invaders = {
           ctx.fillStyle = ok ? hexToRgba(palette.green, 0.92) : hexToRgba(palette.red, 0.85);
           ctx.font='800 18px Barlow, sans-serif';
           ctx.textAlign='left'; ctx.textBaseline='top';
-          ctx.fillText(ok?'Correct.':'Not this one.', left, fbY);
+          ctx.fillText(quizFeedbackHeadline(q, ok), left, fbY);
 
           ctx.fillStyle='rgba(255,255,255,0.72)';
           ctx.font='500 14px Barlow, sans-serif';
@@ -3404,7 +3522,7 @@ const invaders = {
             q.picked=label; q.pickTime=performance.now();
             const ok=(label===q.correct);
             quiz.record(ok);
-            toast(ok?'Correct.':'Not this one.', ok?'ok':'warn', 1200);
+            toast(quizFeedbackHeadline(q, ok), ok?'ok':'warn', 1200);
           }, bOpts);
         }
 
@@ -3417,7 +3535,7 @@ const invaders = {
           ctx.fillStyle = ok ? hexToRgba(palette.green, 0.92) : hexToRgba(palette.red, 0.85);
           ctx.font='900 18px Barlow, sans-serif';
           ctx.textAlign='left'; ctx.textBaseline='top';
-          ctx.fillText(ok?'Correct.':'Not this one.', fbX, fbY+2);
+          ctx.fillText(quizFeedbackHeadline(q, ok), fbX, fbY+2);
 
           ctx.fillStyle='rgba(255,255,255,0.72)';
           ctx.font='600 14px Barlow, sans-serif';
@@ -3439,7 +3557,7 @@ const invaders = {
 
       // ---------- Order picker modal ----------
       if(quiz.orderPicker){
-        const list = ['All'].concat(data.orders||[]);
+        const list = ['All'].concat(quiz.orderList());
         drawScrollPicker({
           list,
           modalW:      clamp(W * 0.38, 320, 480),
@@ -3450,9 +3568,7 @@ const invaders = {
           accent:      palette.green,
           isCurrent:   (o)    => o === ord,
           getLabel:    (o)    => o === 'All' ? 'All orders' : o,
-          getCount:    (o)    => (o === 'All'
-            ? (state.settings.quizMode === 'family' ? data.idx.fam.length : data.idx.sci.length)
-            : quiz.getPool(state.settings.quizMode, o).length).toLocaleString(),
+          getCount:    (o)    => quiz.getPool(state.settings.quizMode, o).length.toLocaleString(),
           onSelect:    (o)    => quiz.setOrder(o)
         });
       }
