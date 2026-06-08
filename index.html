@@ -1096,6 +1096,7 @@ function bumpDay(){
     }
 
     function drawTitle(x,y,main,sub){
+      if(document.fullscreenElement) x += 52;
       const accent = sceneColors[scene] || palette.green;
       ctx.fillStyle='rgba(255,255,255,0.96)';
       ctx.font='800 36px Barlow, sans-serif';
