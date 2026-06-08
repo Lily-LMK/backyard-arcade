@@ -261,6 +261,7 @@
       _vigGrad = null;
       _fireflyGlow = null;
     }
+    function isMobile(){ return W < 600; }
 
     // ---------- UI ----------
     const ui = {
@@ -381,6 +382,9 @@
         ctx.fillText(t.msg, x+24, y+h/2);
       }
     }
+
+    let mobileInfoOpen = false;
+    let invadersMobileDir = 0; // -1 left, 0 none, +1 right
 
     // ---------- Keyboard ----------
     const keysDown=new Set();
@@ -1210,6 +1214,8 @@ function bumpDay(){
       scene=name;
       showHelp=false;
       paused=false;
+      mobileInfoOpen=false;
+      invadersMobileDir=0;
       ui.pointer.clicked=false;
       saveState();
     }
@@ -1220,6 +1226,20 @@ function bumpDay(){
       addButton(pad+152, pad+86, 44, 44, '?', ()=>{ showHelp = !showHelp; }, {fontSize:18, r:12, fontWeight:'700'});
       const _fsLabel = document.fullscreenElement ? '⊟' : '⊞';
       addButton(pad+208, pad+86, 44, 44, _fsLabel, ()=>toggleFullscreen(), {fontSize:17, r:12});
+      if(isMobile()){
+        addButton(pad+264, pad+86, 44, 44, 'ℹ', ()=>{ mobileInfoOpen=!mobileInfoOpen; }, {fontSize:16, r:12, accent: mobileInfoOpen ? sceneColors[scene] : null});
+      }
+    }
+
+    function drawMobileInfoOverlay(contentFn){
+      if(!isMobile() || !mobileInfoOpen) return;
+      const sheetH = Math.min(H*0.55, 380);
+      const y = H - sheetH;
+      roundRect(0, y, W, sheetH, 20);
+      ctx.fillStyle='rgba(8,10,18,0.97)'; ctx.fill();
+      ctx.strokeStyle='rgba(255,255,255,0.14)'; ctx.lineWidth=1; ctx.stroke();
+      addButton(W-48, y+10, 36, 36, '✕', ()=>{ mobileInfoOpen=false; }, {fontSize:14, r:9});
+      contentFn(y, sheetH);
     }
 
     // ---------- Help modal ----------
@@ -1658,8 +1678,9 @@ function bumpDay(){
       set:null,
       draggables:[],
       slots:[],
+      mobileCardIdx:0,
       reset(full=false){
-        this.set=null; this.draggables=[]; this.slots=[];
+        this.set=null; this.draggables=[]; this.slots=[]; this.mobileCardIdx=0;
         if(state.csv.loaded) this.newSet();
       },
       newSet(){
@@ -1707,6 +1728,44 @@ function bumpDay(){
       },
       layout(){
         const pad=Math.max(18, Math.min(44, W*0.05));
+
+        if(isMobile() && this.set && !this.set.error){
+          const ci=this.mobileCardIdx;
+          const top=pad+190;
+          const cardW=W - pad*2 - 104;
+          const cardH=Math.min(240, H*0.30);
+          const slotW=cardW;
+          const slotH=52;
+          const cx=pad+52;
+          for(let i=0;i<3;i++){
+            const s1=this.slots.find(s=>s.imgIdx===i && s.kind==='sci');
+            const s2=this.slots.find(s=>s.imgIdx===i && s.kind==='fam');
+            if(i===ci){
+              if(s1){ s1.x=cx; s1.y=top+cardH+14; s1.w=slotW; s1.h=slotH; }
+              if(s2){ s2.x=cx; s2.y=top+cardH+14+slotH+10; s2.w=slotW; s2.h=slotH; }
+            } else {
+              if(s1){ s1.x=-9999; s1.y=-9999; s1.w=slotW; s1.h=slotH; }
+              if(s2){ s2.x=-9999; s2.y=-9999; s2.w=slotW; s2.h=slotH; }
+            }
+          }
+          const bankTop=top + cardH + 14 + slotH + 10 + slotH + 18;
+          const bankW=W-pad*2;
+          const cols=2;
+          const rowH=52;
+          const bw=(bankW-(cols-1)*14)/cols;
+          let unplaced=this.draggables.filter(d=>!d.placed);
+          for(let i=0;i<unplaced.length;i++){
+            const d=unplaced[i];
+            const r=Math.floor(i/cols); const c=i%cols;
+            const x=pad+c*(bw+14); const y=bankTop+r*(rowH+12);
+            d.w=bw; d.h=rowH; d.homeX=x; d.homeY=y;
+            if(!d.homeSet){ d.x=x; d.y=y; d.homeSet=true; }
+            else if(ui.drag && ui.drag.id===d.id){ d.x=ui.pointer.x-ui.drag.offx; d.y=ui.pointer.y-ui.drag.offy; }
+            else { d.x=lerp(d.x,d.homeX,0.22); d.y=lerp(d.y,d.homeY,0.22); }
+          }
+          return;
+        }
+
         const top=pad+138;
         const cardW=Math.min(360, (W - pad*2 - 24)/3);
         const cardH=Math.min(320, H*0.36);
@@ -1819,6 +1878,7 @@ function bumpDay(){
 
     // ---------- Sidebar geometry helper ----------
     function sidebarWidth(forScene){
+      if(isMobile()) return 0;
       const s = forScene || scene;
       if(s==='snake') return clamp(220 + W*0.03, 200, 280);
       return clamp(320 + W*0.06, 320, 440);
@@ -1829,8 +1889,8 @@ function bumpDay(){
       const gx = pad;
       const gy = pad+150;
       const gw = W - pad*2 - sw - (sw?12:0);
-      // Snake needs bottom space for the D-pad (3×42 + 2×6 gaps + 14 margin + pad)
-      const bottomReserve = (s==='snake') ? 168 : 0;
+      const dpadSize = isMobile() ? 48 : 42;
+      const bottomReserve = (s==='snake') ? (dpadSize*3 + 6*2 + 32) : 0;
       const gh = H - gy - pad - bottomReserve;
       return {x:gx, y:gy, w:gw, h:gh, sw, sx: gx+gw+12, sy: gy};
     }
@@ -2048,6 +2108,7 @@ const invaders = {
     let dir=0;
     if(keysDown.has('ArrowLeft')) dir -= 1;
     if(keysDown.has('ArrowRight')) dir += 1;
+    if(isMobile()) dir += invadersMobileDir;
     this.ship.vx = lerp(this.ship.vx, dir*speed, 0.22);
     this.ship.x += this.ship.vx*dt;
     this.ship.x = clamp(this.ship.x, ar.x+8, ar.x+ar.w-8-this.ship.w);
@@ -2765,11 +2826,22 @@ const invaders = {
         }
       }
 
+      // Invaders mobile touch buttons (hold left/right)
+      if(scene==='invaders' && isMobile()){
+        const mpad=Math.max(18, Math.min(44, W*0.05));
+        const btnH=52, btnW=90, btnY=H-mpad-btnH;
+        const px=ui.pointer.x, py=ui.pointer.y;
+        if(py>=btnY && py<=btnY+btnH){
+          if(px>=mpad && px<=mpad+btnW){ invadersMobileDir=-1; return; }
+          if(px>=mpad+btnW+12 && px<=mpad+btnW*2+12){ invadersMobileDir=1; return; }
+        }
+      }
+
       // Snake on-screen D-pad
       if(scene==='snake'){
         const pad=Math.max(18, Math.min(44, W*0.05));
         const ar=gameAreaRect(pad);
-        const dpadS=42, dpadG=6;
+        const dpadS=isMobile()?48:42, dpadG=6;
         const dpadW=dpadS*3+dpadG*2;
         const bx=ar.x+(ar.w-dpadW)/2;
         const by=ar.y+ar.h+14;
@@ -2784,8 +2856,23 @@ const invaders = {
         else if(hitRect(right,px,py)) snake.setDir(1,0);
       }
     }
-    function pointerMove(){}
-    function pointerUp(){ if(ui.drag && ui.drag.type==='match'){ const d = match.draggables.find(x=>x.id===ui.drag.id); if(d) match.drop(d); ui.drag=null; } }
+    function pointerMove(){
+      // Invaders mobile: update hold direction on drag
+      if(scene==='invaders' && isMobile() && ui.pointer.down){
+        const mpad=Math.max(18, Math.min(44, W*0.05));
+        const btnH=52, btnW=90, btnY=H-mpad-btnH;
+        const px=ui.pointer.x, py=ui.pointer.y;
+        if(py>=btnY && py<=btnY+btnH){
+          if(px>=mpad && px<=mpad+btnW){ invadersMobileDir=-1; return; }
+          if(px>=mpad+btnW+12 && px<=mpad+btnW*2+12){ invadersMobileDir=1; return; }
+        }
+        invadersMobileDir=0;
+      }
+    }
+    function pointerUp(){
+      invadersMobileDir=0;
+      if(ui.drag && ui.drag.type==='match'){ const d = match.draggables.find(x=>x.id===ui.drag.id); if(d) match.drop(d); ui.drag=null; }
+    }
 
     // ---------- Draw camera ship ----------
     function drawCameraShip(x,y,w,h){
@@ -2956,7 +3043,7 @@ const invaders = {
       drawTopBar(pad);
 
       // Scoreboard
-      drawPillRight(W-pad, pad+64, 'Score: '+((state.score&&state.score.quiz!=null)?state.score.quiz:0)+'  Best: '+((state.score&&state.score.quizBest!=null)?state.score.quizBest:0));
+      if(!isMobile()) drawPillRight(W-pad, pad+64, 'Score: '+((state.score&&state.score.quiz!=null)?state.score.quiz:0)+'  Best: '+((state.score&&state.score.quizBest!=null)?state.score.quizBest:0));
 
       // Controls
       const ctrlX = pad+284, ctrlY = pad+86, h = 44, gap = 8;
@@ -3008,7 +3095,8 @@ const invaders = {
       const panelGap = 16;
 
       // Prefer side-by-side layout; squeeze image first if needed.
-      let imgW = clamp(availW*0.62, 320, 760);
+      const imgMinW = isMobile() ? 200 : 320;
+      let imgW = clamp(availW*0.62, imgMinW, 760);
       let panelW = availW - imgW - panelGap;
       if(panelW < 280){
         imgW = Math.max(300, availW - 280 - panelGap);
@@ -3245,48 +3333,83 @@ const invaders = {
       drawTopBar(pad);
 
       // Scoreboard
-      drawPillRight(W-pad, pad+64, 'Score: '+((state.score&&state.score.match!=null)?state.score.match:0)+'  Best: '+((state.score&&state.score.matchBest!=null)?state.score.matchBest:0));
+      if(!isMobile()) drawPillRight(W-pad, pad+64, 'Score: '+((state.score&&state.score.match!=null)?state.score.match:0)+'  Best: '+((state.score&&state.score.matchBest!=null)?state.score.matchBest:0));
 
-      addButton(pad+284, pad+86, 180, 44, 'New set', ()=>{
-        if(!state.csv.loaded) return toast('Load a CSV first.', 'warn', 1600);
-        match.reset(true);
-      }, {fontSize:15, r:12, primary:true});
-      addButton(pad+474, pad+86, 180, 44, 'Return all', ()=>{
-        if(match.set && !match.set.error) match.returnAll();
-      }, {fontSize:15, r:12});
+      if(isMobile()){
+        // Put match controls on a second row below top bar
+        const bw2=(W-pad*2-10)/2;
+        addButton(pad, pad+138, bw2, 40, 'New set', ()=>{ if(!state.csv.loaded) return toast('Load a CSV first.','warn',1600); match.reset(true); }, {fontSize:13, r:10, primary:true});
+        addButton(pad+bw2+10, pad+138, bw2, 40, 'Return all', ()=>{ if(match.set && !match.set.error) match.returnAll(); }, {fontSize:13, r:10});
+      } else {
+        addButton(pad+284, pad+86, 180, 44, 'New set', ()=>{
+          if(!state.csv.loaded) return toast('Load a CSV first.', 'warn', 1600);
+          match.reset(true);
+        }, {fontSize:15, r:12, primary:true});
+        addButton(pad+474, pad+86, 180, 44, 'Return all', ()=>{
+          if(match.set && !match.set.error) match.returnAll();
+        }, {fontSize:15, r:12});
+      }
 
       if(!match.set) match.reset(true);
       if(match.set && match.set.error){
         ctx.fillStyle='rgba(255,255,255,0.86)';
         ctx.font='600 16px Barlow, sans-serif';
         ctx.textAlign='left'; ctx.textBaseline='top';
-        ctx.fillText(match.set.error, pad, pad+140);
+        ctx.fillText(match.set.error, pad, isMobile() ? pad+200 : pad+140);
         return;
       }
 
       match.layout();
 
       const items=match.set.items;
-      const top=pad+138;
-      const cardW=Math.min(360, (W - pad*2 - 24)/3);
-      const cardH=Math.min(320, H*0.36);
-      const gap=Math.max(12, (W - pad*2 - cardW*3)/2);
+      if(isMobile()){
+        // Single-card carousel
+        const ci=match.mobileCardIdx;
+        const top=pad+190;
+        const cardW=W - pad*2 - 104;
+        const cardH=Math.min(240, H*0.30);
+        const cx=pad+52, cy=top;
 
-      for(let i=0;i<3;i++){
-        const cx=pad + i*(cardW+gap);
-        const cy=top;
+        // ◀ ▶ arrows
+        addButton(pad, cy+(cardH-48)/2, 44, 48, '◀', ()=>{ match.mobileCardIdx=(ci+2)%3; }, {fontSize:18, r:12});
+        addButton(W-pad-44, cy+(cardH-48)/2, 44, 48, '▶', ()=>{ match.mobileCardIdx=(ci+1)%3; }, {fontSize:18, r:12});
+
+        // Card
         roundRect(cx,cy,cardW,cardH,18);
         ctx.fillStyle=hexToRgba(palette.blue, 0.06); ctx.fill();
         ctx.strokeStyle=hexToRgba(palette.blue, 0.22); ctx.lineWidth=1; ctx.stroke();
+        const rec=items[ci].img;
+        if(rec.ready && rec.ok && rec.img){ drawFitImage({x:cx, y:cy, w:cardW, h:cardH}, rec.img, 10, 18); }
+        else { ctx.fillStyle='rgba(255,255,255,0.70)'; ctx.font='600 14px Barlow, sans-serif'; ctx.textAlign='left'; ctx.textBaseline='top'; ctx.fillText('Loading…', cx+14, cy+14); }
 
-        const rec=items[i].img;
-        if(rec.ready && rec.ok && rec.img){
-          drawFitImage({x:cx, y:cy, w:cardW, h:cardH}, rec.img, 10, 18);
-        } else {
-          ctx.fillStyle='rgba(255,255,255,0.70)';
-          ctx.font='600 14px Barlow, sans-serif';
-          ctx.textAlign='left'; ctx.textBaseline='top';
-          ctx.fillText('Loading…', cx+14, cy+14);
+        // Dot indicators
+        const dotY=cy+cardH+6;
+        for(let di=0;di<3;di++){
+          ctx.beginPath(); ctx.arc(cx+cardW/2 + (di-1)*16, dotY, di===ci?5:3, 0, Math.PI*2);
+          ctx.fillStyle=di===ci?hexToRgba(palette.blue,0.90):'rgba(255,255,255,0.30)'; ctx.fill();
+        }
+      } else {
+        const top=pad+138;
+        const cardW=Math.min(360, (W - pad*2 - 24)/3);
+        const cardH=Math.min(320, H*0.36);
+        const gap=Math.max(12, (W - pad*2 - cardW*3)/2);
+
+        for(let i=0;i<3;i++){
+          const cx=pad + i*(cardW+gap);
+          const cy=top;
+          roundRect(cx,cy,cardW,cardH,18);
+          ctx.fillStyle=hexToRgba(palette.blue, 0.06); ctx.fill();
+          ctx.strokeStyle=hexToRgba(palette.blue, 0.22); ctx.lineWidth=1; ctx.stroke();
+
+          const rec=items[i].img;
+          if(rec.ready && rec.ok && rec.img){
+            drawFitImage({x:cx, y:cy, w:cardW, h:cardH}, rec.img, 10, 18);
+          } else {
+            ctx.fillStyle='rgba(255,255,255,0.70)';
+            ctx.font='600 14px Barlow, sans-serif';
+            ctx.textAlign='left'; ctx.textBaseline='top';
+            ctx.fillText('Loading…', cx+14, cy+14);
+          }
         }
       }
 
@@ -3308,6 +3431,7 @@ const invaders = {
       }
 
       for(const s of match.slots){
+        if(s.x < -1000) continue; // off-screen (mobile inactive cards)
         const isDropTarget = (hoveredSlot === s);
         roundRect(s.x,s.y,s.w,s.h,16);
 
@@ -3435,11 +3559,13 @@ const invaders = {
       ctx.font='700 16px Barlow, sans-serif';
       ctx.textAlign='left'; ctx.textBaseline='top';
       ctx.fillText('Score: '+invaders.score+'   Lives: '+invaders.lives+'   Best: '+state.lifetime.invaders.best+'   Level: '+invaders.level, pad, pad+126);
-// Side panel
-const sx=ar.sx, sy=ar.sy, sw=ar.sw, sh=ar.h;
 
 const aliveCount = invaders.enemies.filter(e=>e && e.alive).length;
 const acc = invaders.stats.shots ? Math.round(100*invaders.stats.hits/Math.max(1,invaders.stats.shots)) : 0;
+
+if(ar.sw > 0){
+// Side panel
+const sx=ar.sx, sy=ar.sy, sw=ar.sw, sh=ar.h;
 
 const topH=78;
 roundRect(sx, sy, sw, topH, 18);
@@ -3522,6 +3648,47 @@ if(hit){
   ctx.textAlign='left'; ctx.textBaseline='top';
   ctx.fillText('Shoot a specimen to see it here.', sx+12, cardY+40);
 }
+} // end if(ar.sw > 0)
+
+// Mobile: touch buttons for ship movement + fire
+if(isMobile()){
+  const btnH=52, btnW=90, btnY=H-pad-btnH;
+  addButton(pad, btnY, btnW, btnH, '◀', ()=>{}, {fontSize:22, r:14, accent:palette.red});
+  addButton(pad+btnW+12, btnY, btnW, btnH, '▶', ()=>{}, {fontSize:22, r:14, accent:palette.red});
+  addButton(W-pad-100, btnY, 100, btnH, '● FIRE', ()=>invaders.fire(), {fontSize:15, r:14, accent:palette.red, primary:true});
+}
+
+// Mobile info overlay: show last captured specimen
+drawMobileInfoOverlay((sheetY, sheetH)=>{
+  const hit=invaders.lastHit;
+  const mx=16, mw=W-32;
+  ctx.fillStyle=hexToRgba(palette.red, 0.85);
+  ctx.font='800 12px Barlow, sans-serif';
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText('LAST CAPTURED', mx, sheetY+16);
+  ctx.fillText('Enemies: '+aliveCount+'   Accuracy: '+acc+'%', mx, sheetY+32);
+  if(hit){
+    const imgBox={x:mx, y:sheetY+52, w:mw*0.38, h:Math.min(130, sheetH*0.38)};
+    roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,10);
+    ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.fill();
+    if(hit.img && hit.img.ready && hit.img.ok && hit.img.img) drawFitImage(imgBox, hit.img.img, 4, 10);
+    const labelMode=state.settings.invaderLabel;
+    const big=(labelMode==='family')?(hit.fam||'(no family)'):(hit.sci||'(unknown)');
+    let ty=sheetY+54;
+    ctx.fillStyle='rgba(255,255,255,0.92)'; ctx.font='800 15px Barlow, sans-serif';
+    const lines=wrapText(big, mw-imgBox.w-16, ctx.font);
+    ctx.textAlign='left';
+    const tx=imgBox.x+imgBox.w+12;
+    for(const ln of lines.slice(0,2)){ ctx.fillText(ln, tx, ty); ty+=20; }
+    if(hit.common){ ctx.fillStyle='rgba(255,255,255,0.78)'; ctx.font='700 13px Barlow, sans-serif';
+      const cl=wrapText(hit.common, mw-imgBox.w-16, ctx.font);
+      for(const ln of cl.slice(0,2)){ ctx.fillText(ln, tx, ty); ty+=17; }
+    }
+  } else {
+    ctx.fillStyle='rgba(255,255,255,0.52)'; ctx.font='600 13px Barlow, sans-serif';
+    ctx.fillText('Shoot a specimen to see it here.', mx, sheetY+60);
+  }
+});
 
 if(!paused && invaders.lives>0) invaders.update(dt);
 
@@ -3690,70 +3857,102 @@ if(invaders.grid){
       ctx.textAlign='left'; ctx.textBaseline='top';
       ctx.fillText('Score: '+snake.score+'   Best: '+state.lifetime.snake.best, pad, pad+126);
       // sidebar (target specimen)
-      const sx=ar.sx, sy=ar.sy, sw=ar.sw, sh=ar.h;
-      const padS=12;
-
-      roundRect(sx, sy, sw, sh, 18);
-      ctx.fillStyle=hexToRgba(palette.orange, 0.06); ctx.fill();
-      ctx.strokeStyle=hexToRgba(palette.orange, 0.18); ctx.lineWidth=1; ctx.stroke();
-
-      ctx.fillStyle=hexToRgba(palette.orange, 0.90);
-      ctx.font='900 12px Barlow, sans-serif';
-      ctx.textAlign='left'; ctx.textBaseline='top';
       const now=performance.now();
       const showingCaptured = snake.flashSpec && (now < snake.flashUntil);
-
-      ctx.fillText(showingCaptured ? 'CAPTURED' : 'TARGET', sx+padS, sy+padS);
-
       const target = showingCaptured ? snake.flashSpec : snake.food;
-      if(target){
-        const imgBox={x:sx+padS, y:sy+padS+26, w:sw-padS*2, h:Math.min(200, sh*0.48)};
-        roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,14);
-        ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.fill();
-        ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.stroke();
 
-        if(target.img && target.img.ready && target.img.ok && target.img.img){
-          drawFitImage(imgBox, target.img.img, 5, 14);
-        } else {
-          ctx.fillStyle='rgba(255,255,255,0.40)';
-          ctx.font='700 12px Barlow, sans-serif';
-          ctx.textAlign='center'; ctx.textBaseline='middle';
-          ctx.fillText('loading…', imgBox.x+imgBox.w/2, imgBox.y+imgBox.h/2);
-        }
+      if(ar.sw > 0){
+        const sx=ar.sx, sy=ar.sy, sw=ar.sw, sh=ar.h;
+        const padS=12;
 
-        let ty=imgBox.y+imgBox.h+12;
+        roundRect(sx, sy, sw, sh, 18);
+        ctx.fillStyle=hexToRgba(palette.orange, 0.06); ctx.fill();
+        ctx.strokeStyle=hexToRgba(palette.orange, 0.18); ctx.lineWidth=1; ctx.stroke();
 
-        if(target.common){
-          ctx.fillStyle='rgba(255,255,255,0.86)';
-          ctx.font='800 14px Barlow, sans-serif';
+        ctx.fillStyle=hexToRgba(palette.orange, 0.90);
+        ctx.font='900 12px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText(showingCaptured ? 'CAPTURED' : 'TARGET', sx+padS, sy+padS);
+
+        if(target){
+          const imgBox={x:sx+padS, y:sy+padS+26, w:sw-padS*2, h:Math.min(200, sh*0.48)};
+          roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,14);
+          ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.fill();
+          ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.stroke();
+
+          if(target.img && target.img.ready && target.img.ok && target.img.img){
+            drawFitImage(imgBox, target.img.img, 5, 14);
+          } else {
+            ctx.fillStyle='rgba(255,255,255,0.40)';
+            ctx.font='700 12px Barlow, sans-serif';
+            ctx.textAlign='center'; ctx.textBaseline='middle';
+            ctx.fillText('loading…', imgBox.x+imgBox.w/2, imgBox.y+imgBox.h/2);
+          }
+
+          let ty=imgBox.y+imgBox.h+12;
+
+          if(target.common){
+            ctx.fillStyle='rgba(255,255,255,0.86)';
+            ctx.font='800 14px Barlow, sans-serif';
+            ctx.textAlign='left'; ctx.textBaseline='top';
+            const cl=wrapText(target.common, sw-padS*2, ctx.font);
+            for(const ln of cl.slice(0,2)){ ctx.fillText(ln, sx+padS, ty); ty+=18; }
+            ty+=2;
+          }
+
+          ctx.fillStyle='rgba(255,255,255,0.78)';
+          ctx.font='750 13px Barlow, sans-serif';
           ctx.textAlign='left'; ctx.textBaseline='top';
-          const cl=wrapText(target.common, sw-padS*2, ctx.font);
-          for(const ln of cl.slice(0,2)){ ctx.fillText(ln, sx+padS, ty); ty+=18; }
-          ty+=2;
+          const sl=wrapText(target.sci || '(unknown)', sw-padS*2, ctx.font);
+          for(const ln of sl.slice(0,2)){ ctx.fillText(ln, sx+padS, ty); ty+=16; }
+
+          ctx.fillStyle='rgba(255,255,255,0.62)';
+          ctx.font='700 13px Barlow, sans-serif';
+          const fl=wrapText('Family: '+(target.fam||'(no family)'), sw-padS*2, ctx.font);
+          for(const ln of fl.slice(0,2)){ ctx.fillText(ln, sx+padS, ty); ty+=16; }
+
+          const by=sy+sh-52;
+          addButton(sx+padS, by, sw-padS*2, 40, 'Open record', ()=>{
+            const u=target.recordUrl || target.url;
+            try{ window.open(u, '_blank'); }catch(_){}
+          }, {fontSize:14, r:12});
+        } else {
+          ctx.fillStyle='rgba(255,255,255,0.55)';
+          ctx.font='700 14px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          ctx.fillText('No target yet.', sx+padS, sy+padS+30);
         }
+      } // end if(ar.sw > 0)
 
-        ctx.fillStyle='rgba(255,255,255,0.78)';
-        ctx.font='750 13px Barlow, sans-serif';
+      // Mobile info overlay: target / captured specimen
+      drawMobileInfoOverlay((sheetY, sheetH)=>{
+        const mx=16, mw=W-32;
+        ctx.fillStyle=hexToRgba(palette.orange, 0.85);
+        ctx.font='800 12px Barlow, sans-serif';
         ctx.textAlign='left'; ctx.textBaseline='top';
-        const sl=wrapText(target.sci || '(unknown)', sw-padS*2, ctx.font);
-        for(const ln of sl.slice(0,2)){ ctx.fillText(ln, sx+padS, ty); ty+=16; }
-
-        ctx.fillStyle='rgba(255,255,255,0.62)';
-        ctx.font='700 13px Barlow, sans-serif';
-        const fl=wrapText('Family: '+(target.fam||'(no family)'), sw-padS*2, ctx.font);
-        for(const ln of fl.slice(0,2)){ ctx.fillText(ln, sx+padS, ty); ty+=16; }
-
-        const by=sy+sh-52;
-        addButton(sx+padS, by, sw-padS*2, 40, 'Open record', ()=>{
-          const u=target.recordUrl || target.url;
-          try{ window.open(u, '_blank'); }catch(_){}
-        }, {fontSize:14, r:12});
-      } else {
-        ctx.fillStyle='rgba(255,255,255,0.55)';
-        ctx.font='700 14px Barlow, sans-serif';
-        ctx.textAlign='left'; ctx.textBaseline='top';
-        ctx.fillText('No target yet.', sx+padS, sy+padS+30);
-      }
+        ctx.fillText(showingCaptured ? 'CAPTURED' : 'TARGET SPECIMEN', mx, sheetY+16);
+        if(target){
+          const imgBox={x:mx, y:sheetY+40, w:mw*0.38, h:Math.min(120, sheetH*0.35)};
+          roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,10);
+          ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.fill();
+          if(target.img && target.img.ready && target.img.ok && target.img.img) drawFitImage(imgBox, target.img.img, 4, 10);
+          const tx=imgBox.x+imgBox.w+12;
+          let ty=sheetY+42;
+          if(target.common){ ctx.fillStyle='rgba(255,255,255,0.90)'; ctx.font='800 15px Barlow, sans-serif';
+            const cl=wrapText(target.common, mw-imgBox.w-16, ctx.font);
+            for(const ln of cl.slice(0,2)){ ctx.fillText(ln, tx, ty); ty+=20; }
+          }
+          ctx.fillStyle='rgba(255,255,255,0.72)'; ctx.font='700 13px Barlow, sans-serif';
+          const sl=wrapText(target.sci||'(unknown)', mw-imgBox.w-16, ctx.font);
+          for(const ln of sl.slice(0,2)){ ctx.fillText(ln, tx, ty); ty+=16; }
+          ctx.fillStyle='rgba(255,255,255,0.55)'; ctx.font='700 12px Barlow, sans-serif';
+          const fl=wrapText('Family: '+(target.fam||'(no family)'), mw-imgBox.w-16, ctx.font);
+          for(const ln of fl.slice(0,2)){ ctx.fillText(ln, tx, ty); ty+=15; }
+        } else {
+          ctx.fillStyle='rgba(255,255,255,0.52)'; ctx.font='600 13px Barlow, sans-serif';
+          ctx.fillText('No target yet.', mx, sheetY+48);
+        }
+      });
 
       if(!paused && snake.alive) snake.update(dt);
 
@@ -3841,7 +4040,7 @@ if(invaders.grid){
       }
 
       // D-pad — positioned below the game area
-      const dpadS = 42, dpadG = 6;
+      const dpadS = isMobile() ? 48 : 42, dpadG = 6;
       const dpadW = dpadS*3 + dpadG*2;
       const dpadBx = ar.x + (ar.w - dpadW)/2;  // centered under the game
       const dpadBy = ar.y + ar.h + 14;
@@ -3894,39 +4093,51 @@ if(invaders.grid){
       const ar=gameAreaRect(pad);
 
       // top controls (date + family filtering)
-      const ctrlX = pad+284, ctrlY = pad+86, h = 44, gap = 8;
-      const avail = Math.max(320, (W - pad) - ctrlX);
-
-      const wArrow = 40, wAuto = 130, wReset = 88, wSwarm = 88;
-      const fixed = (wArrow*2 + wAuto + wReset + wSwarm + gap*6);
-      let rem = Math.max(160, avail - fixed);
-
-      let wFam = 0;
-      let wDate = rem;
-      if(data.keys.family){
-        wFam = clamp(rem*0.46, 130, 220);
-        wDate = clamp(rem - wFam, 150, 260);
-        const excess = (wDate + wFam) - rem;
-        if(excess > 0){ wDate -= excess*0.55; wFam -= excess*0.45; }
+      const ctrlY = pad+86, h = 44, gap = 8;
+      if(isMobile()){
+        // Mobile: ◀ Date ▶ Auto only (one compact row)
+        const wArrow2=44, wAuto2=110;
+        const wDate2 = W - pad*2 - wArrow2*2 - wAuto2 - gap*3;
+        let x2=pad;
+        addButton(x2, ctrlY, wArrow2, h, '◀', ()=>night.prevDate(), {fontSize:16, r:12}); x2+=wArrow2+gap;
+        addButton(x2, ctrlY, wDate2, h, ('Date: ' + night.currentDate() + ' ▾'), ()=>night.toggleDatePicker(), {fontSize:14, r:12, primary: night.datePicker}); x2+=wDate2+gap;
+        addButton(x2, ctrlY, wArrow2, h, '▶', ()=>night.nextDate(), {fontSize:16, r:12}); x2+=wArrow2+gap;
+        addButton(x2, ctrlY, wAuto2, h, night.autoplay?'Auto: on':'Auto: off', ()=>night.toggleAuto(), {fontSize:14, r:12, primary: night.autoplay});
       } else {
-        wDate = clamp(rem, 170, 320);
+        const ctrlX = pad+284;
+        const avail = Math.max(320, (W - pad) - ctrlX);
+
+        const wArrow = 40, wAuto = 130, wReset = 88, wSwarm = 88;
+        const fixed = (wArrow*2 + wAuto + wReset + wSwarm + gap*6);
+        let rem = Math.max(160, avail - fixed);
+
+        let wFam = 0;
+        let wDate = rem;
+        if(data.keys.family){
+          wFam = clamp(rem*0.46, 130, 220);
+          wDate = clamp(rem - wFam, 150, 260);
+          const excess = (wDate + wFam) - rem;
+          if(excess > 0){ wDate -= excess*0.55; wFam -= excess*0.45; }
+        } else {
+          wDate = clamp(rem, 170, 320);
+        }
+
+        let x = ctrlX;
+        addButton(x, ctrlY, wArrow, h, '◀', ()=>night.prevDate(), {fontSize:16, r:12}); x += wArrow + gap;
+        addButton(x, ctrlY, wDate, h, ('Date: ' + night.currentDate() + ' ▾'), ()=>night.toggleDatePicker(), {fontSize:14, r:12, primary: night.datePicker}); x += wDate + gap;
+        addButton(x, ctrlY, wArrow, h, '▶', ()=>night.nextDate(), {fontSize:16, r:12}); x += wArrow + gap;
+
+        if(data.keys.family){
+          const famLabel = night.familyFilter==='All' ? 'All families' : night.familyFilter;
+          addButton(x, ctrlY, wFam, h, ('Family: ' + famLabel + ' ▾'), ()=>night.toggleFamilyPicker(), {fontSize:14, r:12, primary: night.familyPicker}); x += wFam + gap;
+        } else {
+          addButton(x, ctrlY, 170, h, 'Family: n/a', ()=>toast('No family column found in CSV.', 'info', 1200), {fontSize:14, r:12}); x += 170 + gap;
+        }
+
+        addButton(x, ctrlY, wAuto, h, night.autoplay?'Auto: on':'Auto: off', ()=>night.toggleAuto(), {fontSize:14, r:12, primary: night.autoplay}); x += wAuto + gap;
+        addButton(x, ctrlY, wReset, h, 'Reset', ()=>night.loadDate(night.currentDate()), {fontSize:14, r:12}); x += wReset + gap;
+        addButton(x, ctrlY, wSwarm, h, 'Swarm', ()=>night.swarm(), {fontSize:14, r:12});
       }
-
-      let x = ctrlX;
-      addButton(x, ctrlY, wArrow, h, '◀', ()=>night.prevDate(), {fontSize:16, r:12}); x += wArrow + gap;
-      addButton(x, ctrlY, wDate, h, ('Date: ' + night.currentDate() + ' ▾'), ()=>night.toggleDatePicker(), {fontSize:14, r:12, primary: night.datePicker}); x += wDate + gap;
-      addButton(x, ctrlY, wArrow, h, '▶', ()=>night.nextDate(), {fontSize:16, r:12}); x += wArrow + gap;
-
-      if(data.keys.family){
-        const famLabel = night.familyFilter==='All' ? 'All families' : night.familyFilter;
-        addButton(x, ctrlY, wFam, h, ('Family: ' + famLabel + ' ▾'), ()=>night.toggleFamilyPicker(), {fontSize:14, r:12, primary: night.familyPicker}); x += wFam + gap;
-      } else {
-        addButton(x, ctrlY, 170, h, 'Family: n/a', ()=>toast('No family column found in CSV.', 'info', 1200), {fontSize:14, r:12}); x += 170 + gap;
-      }
-
-      addButton(x, ctrlY, wAuto, h, night.autoplay?'Auto: on':'Auto: off', ()=>night.toggleAuto(), {fontSize:14, r:12, primary: night.autoplay}); x += wAuto + gap;
-      addButton(x, ctrlY, wReset, h, 'Reset', ()=>night.loadDate(night.currentDate()), {fontSize:14, r:12}); x += wReset + gap;
-      addButton(x, ctrlY, wSwarm, h, 'Swarm', ()=>night.swarm(), {fontSize:14, r:12});
 
       if(!state.csv.loaded){
         ctx.fillStyle='rgba(255,255,255,0.78)';
@@ -4051,6 +4262,9 @@ if(invaders.grid){
         }
       }
 
+      const sel = night.selected;
+
+      if(ar.sw > 0){
       // right sidebar: family legend + selected detail
       const sx=ar.sx, sy=ar.sy, sw=ar.sw, sh=ar.h;
       roundRect(sx, sy, sw, sh, 22);
@@ -4129,7 +4343,6 @@ if(invaders.grid){
       ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.lineWidth=1; ctx.stroke();
 
       // Selected panel
-      const sel = night.selected;
       const panelY = _divY + 8;
       const panelH = Math.max(100, sh - (panelY-sy) - 8);
       roundRect(sx+12, panelY, sw-24, panelH, 16);
@@ -4214,6 +4427,38 @@ if(invaders.grid){
         ctx.textAlign='left'; ctx.textBaseline='top';
         ctx.fillText('Tap an arrival to explore.', sx+20, panelY+14);
       }
+      } // end if(ar.sw > 0)
+
+      // Mobile info overlay: selected specimen
+      drawMobileInfoOverlay((sheetY, sheetH)=>{
+        const mx=16, mw=W-32;
+        ctx.fillStyle=hexToRgba(palette.purple, 0.85);
+        ctx.font='800 12px Barlow, sans-serif';
+        ctx.textAlign='left'; ctx.textBaseline='top';
+        ctx.fillText('SELECTED', mx, sheetY+16);
+        if(sel){
+          const imgBox={x:mx, y:sheetY+40, w:mw*0.38, h:Math.min(120, sheetH*0.35)};
+          roundRect(imgBox.x,imgBox.y,imgBox.w,imgBox.h,10);
+          ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.fill();
+          if(sel.img && sel.img.ready && sel.img.ok && sel.img.img) drawFitImage(imgBox, sel.img.img, 4, 10);
+          const tx=imgBox.x+imgBox.w+12;
+          let ty=sheetY+42;
+          if(sel.common){ ctx.fillStyle='rgba(255,255,255,0.92)'; ctx.font='800 15px Barlow, sans-serif';
+            const cl=wrapText(sel.common, mw-imgBox.w-16, ctx.font);
+            for(const ln of cl.slice(0,2)){ ctx.fillText(ln, tx, ty); ty+=20; }
+          }
+          ctx.fillStyle='rgba(255,255,255,0.68)'; ctx.font='600 12px Barlow, sans-serif';
+          ctx.textAlign='left'; ctx.textBaseline='top';
+          const sl2=wrapText(sel.sci||'(unknown)', mw-imgBox.w-16, ctx.font);
+          for(const ln of sl2.slice(0,1)){ ctx.fillText(ln, tx, ty); ty+=16; }
+          if(sel.fam){ ctx.fillStyle='rgba(255,255,255,0.50)'; ctx.font='600 11px Barlow, sans-serif';
+            ctx.fillText(sel.fam, tx, ty); ty+=15;
+          }
+        } else {
+          ctx.fillStyle='rgba(255,255,255,0.52)'; ctx.font='600 13px Barlow, sans-serif';
+          ctx.fillText('Tap an arrival to explore.', mx, sheetY+48);
+        }
+      });
 
       // picker overlays drawn last so they render on top of sprites and sidebar
       if(night.datePicker){
